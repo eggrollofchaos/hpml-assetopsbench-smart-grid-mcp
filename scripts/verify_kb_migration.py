@@ -373,6 +373,42 @@ def gate_cross_repo_migrated(wt: str, excl: list[str]) -> list[str]:
     return fails
 
 
+_REF_LINK = re.compile(r"\]\(([^)]*reference/[A-Za-z0-9_./-]+\.md)(?:#[^)]*)?\)")
+
+
+def gate_live_reference_links(wt: str, excl: list[str]) -> list[str]:
+    """Every live Markdown link whose target contains a `reference/<...>.md` segment
+    must resolve from its SOURCE file. Closes the migration blind spot where a doc
+    OUTSIDE the moved tree still links to a retired `docs/reference` leaf via a bare
+    (`reference/x.md`) or relative (`../docs/reference/x.md`) path: gate 2 only scans
+    inside the moved tree, and the live-path gate only greps literal `docs/reference/`
+    survivors, so a bare `reference/x.md` link silently rots. External (http/absolute)
+    and repo-escaping (cross-repo) links are skipped; frozen surfaces are excluded."""
+    bad = []
+    for ln in sh(
+        "git",
+        "grep",
+        "-nIoE",
+        r"\]\([^)]*reference/[A-Za-z0-9_./-]+\.md[^)]*\)",
+        "--",
+        *excl,
+    ).splitlines():
+        f, _, m = ln.split(":", 2)
+        mm = _REF_LINK.search(m)
+        if not mm:
+            continue
+        link = mm.group(1)
+        if link.startswith(("http://", "https://", "/", "~", "mailto:")):
+            continue
+        tgt = os.path.normpath(os.path.join(wt, os.path.dirname(f), link))
+        rel = os.path.relpath(tgt, wt)
+        if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+            continue  # cross-repo / repo-escaping — not locally verifiable
+        if not os.path.exists(tgt):
+            bad.append(f"{f}: {link}")
+    return bad
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -409,6 +445,10 @@ def main() -> int:
         (
             "cross-repo-migrated (sibling retired docs/reference)",
             gate_cross_repo_migrated(wt, excl),
+        ),
+        (
+            "live-reference-links (resolve outside the moved tree)",
+            gate_live_reference_links(wt, excl),
         ),
         ("yaml-valid (real YAML parse)", gate_yaml_valid(wt)),
     ):

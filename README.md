@@ -146,7 +146,7 @@ metrics under `results/metrics/`.
 ├── results/                      # Curated metrics + figures - see results/README.md
 │
 ├── docs/                         # Living authored documentation - see docs/README.md
-│   └── reference/               #   Lower-churn class / mentor / setup reference docs
+│   └── knowledge-base/reference/               #   Lower-churn class / mentor / setup reference docs
 ├── planning/                     # Meeting agendas + working notes
 └── reports/                      # Build notes, historical submissions, and report work products - see reports/README.md
     └── archive/                  #   Superseded drafts
