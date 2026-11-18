@@ -30,6 +30,7 @@ Rules implemented (per convention § Validator):
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -77,6 +78,7 @@ SINK_FILENAMES = {
 DECISIONS_DIR_PARTS = ("knowledge-base", "decisions")
 
 KEY_RE = re.compile(r"^([A-Za-z0-9_-]+):(?:[ \t]*(.*))?$")
+REFERENCE_UNDATED_MARKER = "docs/knowledge-base/.reference-undated"
 DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_(.+)\.md$")
 ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 KEBAB_TAG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -372,6 +374,11 @@ def topic_slug_from_filename(filename: str) -> tuple[str | None, str]:
     return None, filename.rsplit(".", 1)[0]
 
 
+def is_reference_doc(path: Path, root: Path) -> bool:
+    """True for any file under docs/knowledge-base/reference/ at any depth."""
+    return (root / "docs/knowledge-base/reference") in path.parents
+
+
 def is_sink_file(path: Path) -> bool:
     return path.name in SINK_FILENAMES
 
@@ -448,8 +455,8 @@ def validate_schema(
                         f"`slug: {slug_value}` does not match filename topic `{topic_from_filename}`",
                     )
                 )
-            # Also enforce that non-exception files have a date prefix.
-            if date_prefix is None:
+            # Non-reference files keep the YYYY-MM-DD_ prefix.
+            if date_prefix is None and not is_reference_doc(path, root):
                 parsed.errors.append(
                     ValidationError(
                         path,
@@ -457,6 +464,25 @@ def validate_schema(
                         f"file `{path.name}` missing required date prefix (YYYY-MM-DD_)",
                     )
                 )
+    # reference/** docs hold current state: undated `<topic-slug>.md` at any depth; the
+    # birth date lives in `created` (ISSUE-AGT-2756). The refusal is an error once the repo
+    # has migrated (marker docs/knowledge-base/.reference-undated, written by
+    # scripts/kb_undate_reference.py), a warning before that. A seat may downgrade a run
+    # with KB_ALLOW_DATED_REFERENCE=<reason>.
+    if date_prefix is not None and is_reference_doc(path, root):
+        override = os.environ.get("KB_ALLOW_DATED_REFERENCE", "").strip()
+        migrated = (root / REFERENCE_UNDATED_MARKER).is_file()
+        parsed.errors.append(
+            ValidationError(
+                path,
+                1,
+                f"reference/ file `{path.name}` has a date prefix; rename to "
+                f"`{topic_from_filename}.md` (the date stays in `created`)"
+                + (f" [override: KB_ALLOW_DATED_REFERENCE={override}]" if override else "")
+                + ("" if migrated else " [warning: repo not yet migrated, no docs/knowledge-base/.reference-undated marker]"),
+                is_warning=bool(override) or not migrated,
+            )
+        )
 
     # 5. Date sanity. created valid ISO; created <= updated.
     created_value = str(data.get("created") or "")
