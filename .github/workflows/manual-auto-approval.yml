@@ -7,6 +7,14 @@ on:
         description: 'PR number to auto-approve'
         required: true
         type: string
+      expectedBaseSha:
+        description: 'Cleared base commit SHA'
+        required: true
+        type: string
+      expectedHeadSha:
+        description: 'Cleared head commit SHA'
+        required: true
+        type: string
 
 jobs:
   auto-approve:
@@ -14,7 +22,147 @@ jobs:
     permissions:
       pull-requests: write
     steps:
-      - uses: hmarr/auto-approve-action@v4
-        with:
-          pull-request-number: ${{ github.event.inputs.pullRequestNumber }}
-          review-message: "Auto-approved via gh workflow run"
+      - name: Approve pull request
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.inputs.pullRequestNumber }}
+          EXPECTED_BASE: ${{ github.event.inputs.expectedBaseSha }}
+          EXPECTED_HEAD: ${{ github.event.inputs.expectedHeadSha }}
+          APPROVER: ${{ github.actor }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          read_pair() {
+            local pair live_base live_head
+            if ! pair="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" \
+              --jq '[.base.sha, .head.sha] | @tsv')"; then
+              echo "Refusing approval: could not read live base/head" >&2
+              return 1
+            fi
+            IFS=$'\t' read -r live_base live_head <<< "$pair"
+            if [[ ! "$live_base" =~ ^[0-9a-f]{40}$ || ! "$live_head" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Refusing approval: could not read full live base/head SHAs" >&2
+              return 1
+            fi
+            printf '%s\t%s\n' "$live_base" "$live_head"
+          }
+
+          dismiss_review() {
+            local dismissal_message="$1" review_state
+            if ! gh api --method PUT \
+              "repos/$REPOSITORY/pulls/$PR_NUMBER/reviews/$review_id/dismissals" \
+              -f message="$dismissal_message"; then
+              echo "MANUAL ACTION REQUIRED: approval $review_id could not be dismissed" >&2
+              return 1
+            fi
+            if ! review_state="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER/reviews/$review_id" --jq '.state')"; then
+              echo "MANUAL ACTION REQUIRED: could not verify dismissal of approval $review_id" >&2
+              return 1
+            fi
+            if [[ "$review_state" != "DISMISSED" ]]; then
+              echo "MANUAL ACTION REQUIRED: approval $review_id remains $review_state" >&2
+              return 1
+            fi
+          }
+
+          dismiss_unknown_review() {
+            local candidate_ids candidate_id found_owned_candidate=0
+            if ! candidate_ids="$(gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/reviews" \
+              --jq '.[] | select(.user.login == "github-actions[bot]" and .commit_id == env.EXPECTED_HEAD and .state == "APPROVED" and .body == env.APPROVAL_BODY) | .id')"; then
+              echo "MANUAL ACTION REQUIRED: could not determine whether approval was created" >&2
+              return 1
+            fi
+            if [[ -z "$candidate_ids" ]]; then
+              echo "MANUAL ACTION REQUIRED: no workflow-owned approval found at this head" >&2
+              return 1
+            fi
+            while IFS= read -r candidate_id; do
+              if [[ ! "$candidate_id" =~ ^[0-9]+$ ]]; then
+                echo "MANUAL ACTION REQUIRED: approval id $candidate_id is invalid" >&2
+                return 1
+              fi
+              if [[ $'\n'"$approval_ids_before_post"$'\n' == *$'\n'"$candidate_id"$'\n'* ]]; then
+                continue
+              fi
+              review_id="$candidate_id"
+              if ! dismiss_review "Dismissed automatically because guarded approval creation could not be confirmed"; then
+                return 1
+              fi
+              found_owned_candidate=1
+            done <<< "$candidate_ids"
+            if (( ! found_owned_candidate )); then
+              echo "MANUAL ACTION REQUIRED: no new workflow-owned approval found at this attempt" >&2
+              return 1
+            fi
+          }
+
+          if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "Refusing approval: invalid PR number $PR_NUMBER" >&2
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_BASE" =~ ^[0-9a-f]{40}$ || ! "$EXPECTED_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Refusing approval: expected SHAs must be full 40-hex commits" >&2
+            exit 1
+          fi
+          if [[ ! "${GITHUB_RUN_ID:-}" =~ ^[0-9]+$ ]]; then
+            echo "Refusing approval: missing GitHub workflow run id" >&2
+            exit 1
+          fi
+          if [[ ! "${GITHUB_RUN_ATTEMPT:-}" =~ ^[0-9]+$ ]]; then
+            echo "Refusing approval: missing GitHub workflow run attempt" >&2
+            exit 1
+          fi
+          APPROVAL_BODY="Auto-approved by $APPROVER via guarded manual workflow run $GITHUB_RUN_ID attempt $GITHUB_RUN_ATTEMPT"
+          export APPROVAL_BODY
+
+          if ! pair="$(read_pair)"; then
+            exit 1
+          fi
+          IFS=$'\t' read -r live_base live_head <<< "$pair"
+          if [[ "$live_base" != "$EXPECTED_BASE" || "$live_head" != "$EXPECTED_HEAD" ]]; then
+            echo "Refusing approval: expected $EXPECTED_BASE..$EXPECTED_HEAD, found $live_base..$live_head" >&2
+            exit 1
+          fi
+          if ! approval_ids_before_post="$(gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/reviews" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and .commit_id == env.EXPECTED_HEAD and .state == "APPROVED") | .id')"; then
+            echo "MANUAL ACTION REQUIRED: could not snapshot approvals before creating one" >&2
+            exit 1
+          fi
+
+          if ! review_id="$(gh api --method POST \
+            "repos/$REPOSITORY/pulls/$PR_NUMBER/reviews" \
+            -f event=APPROVE \
+            -f commit_id="$EXPECTED_HEAD" \
+            -f body="$APPROVAL_BODY" \
+            --jq '.id')"; then
+            if ! dismiss_unknown_review; then
+              exit 1
+            fi
+            echo "Approval invalidated: could not confirm review creation" >&2
+            exit 1
+          fi
+          if [[ ! "$review_id" =~ ^[0-9]+$ ]]; then
+            if ! dismiss_unknown_review; then
+              exit 1
+            fi
+            echo "Approval failed: API did not return a review id" >&2
+            exit 1
+          fi
+
+          if ! pair="$(read_pair)"; then
+            if ! dismiss_review "Dismissed automatically because guarded approval could not verify the live base/head after approval"; then
+              exit 1
+            fi
+            echo "Approval invalidated: could not read live base/head after approval" >&2
+            exit 1
+          fi
+          IFS=$'\t' read -r live_base live_head <<< "$pair"
+          if [[ "$live_base" != "$EXPECTED_BASE" || "$live_head" != "$EXPECTED_HEAD" ]]; then
+            if ! dismiss_review "Dismissed automatically because guarded approval observed PR base/head drift"; then
+              exit 1
+            fi
+            echo "Approval invalidated: PR changed to $live_base..$live_head" >&2
+            exit 1
+          fi
