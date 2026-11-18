@@ -413,7 +413,11 @@ def check_dated_reference_name(parsed: ParsedFile, root: Path) -> None:
             f"reference/ file `{path.name}` has a date prefix; rename to "
             f"`{topic_from_filename}.md` (the date stays in `created`)"
             + (f" [override: KB_ALLOW_DATED_REFERENCE={override}]" if override else "")
-            + ("" if migrated else " [warning: repo not yet migrated, no docs/knowledge-base/.reference-undated marker]"),
+            + (
+                ""
+                if migrated
+                else " [warning: repo not yet migrated, no docs/knowledge-base/.reference-undated marker]"
+            ),
             is_warning=bool(override) or not migrated,
         )
     )
