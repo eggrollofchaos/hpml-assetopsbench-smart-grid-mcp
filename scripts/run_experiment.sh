@@ -80,6 +80,14 @@ TRIALS="${TRIALS:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 HARNESS_VERBOSE="${HARNESS_VERBOSE:-1}"
 ENABLE_SMARTGRID_SERVERS="${ENABLE_SMARTGRID_SERVERS:-1}"
+case "$ENABLE_SMARTGRID_SERVERS" in
+  0|1) ;;
+  *)
+    echo "ERROR: ENABLE_SMARTGRID_SERVERS must be exactly 0 or 1 (got: $ENABLE_SMARTGRID_SERVERS)" >&2
+    exit 2
+    ;;
+esac
+export ENABLE_SMARTGRID_SERVERS
 ENABLE_WANDB="${ENABLE_WANDB:-0}"
 WANDB_PROJECT="${WANDB_PROJECT:-assetopsbench-smartgrid}"
 WANDB_ENTITY="${WANDB_ENTITY:-assetopsbench-smartgrid}"
@@ -94,11 +102,10 @@ export SMARTGRID_RESUME_REQUIRE_LATENCY SMARTGRID_BATCH_ID
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 VLLM_MODEL_PATH="${VLLM_MODEL_PATH:-models/Llama-3.1-8B-Instruct}"
-VLLM_SERVED_MODEL_NAME="${VLLM_SERVED_MODEL_NAME:-$(basename "$VLLM_MODEL_PATH")}"
+VLLM_SERVED_MODEL_NAME="${VLLM_SERVED_MODEL_NAME:-${VLLM_MODEL_PATH##*/}}"
 VLLM_DTYPE="${VLLM_DTYPE:-float16}"
 EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:-}"
 VLLM_GENERATION_CONFIG="${VLLM_GENERATION_CONFIG:-vllm}"
-export VLLM_DTYPE EXTRA_VLLM_ARGS VLLM_GENERATION_CONFIG
 VLLM_ENABLE_AUTO_TOOL_CHOICE="${VLLM_ENABLE_AUTO_TOOL_CHOICE:-1}"
 # Default tool-call parser is model-family-aware. Llama-3.x → llama3_json
 # (the team's pinned `Llama-3.1-8B-Instruct`). Other families
@@ -126,6 +133,10 @@ TEMPERATURE="${TEMPERATURE:-0.0}"
 MAX_TOKENS="${MAX_TOKENS:-0}"
 export MAX_TOKENS
 JUDGE_MODEL="${JUDGE_MODEL:-}"
+
+export VLLM_MODEL_PATH VLLM_SERVED_MODEL_NAME VLLM_DTYPE EXTRA_VLLM_ARGS
+export VLLM_GENERATION_CONFIG VLLM_ENABLE_AUTO_TOOL_CHOICE VLLM_TOOL_CALL_PARSER
+export LAUNCH_VLLM SERVING_STACK QUANTIZATION_MODE
 AAT_RUNNER_TEMPLATE="${AAT_RUNNER_TEMPLATE:-}"
 AAT_OPENAI_AGENTS_VERSION="${AAT_OPENAI_AGENTS_VERSION:-0.14.5}"
 AAT_MCP_VERSION="${AAT_MCP_VERSION:-1.27.0}"
@@ -134,6 +145,12 @@ AAT_MCP_SERVER_PYTHON="${AAT_MCP_SERVER_PYTHON:-}"
 AAT_MCP_SERVER_LAUNCH_MODE="${AAT_MCP_SERVER_LAUNCH_MODE:-python}"
 AAT_MCP_CLIENT_TIMEOUT_SECONDS="${AAT_MCP_CLIENT_TIMEOUT_SECONDS:-30}"
 AAT_PARALLEL_TOOL_CALLS="${AAT_PARALLEL_TOOL_CALLS:-false}"
+if [ -n "${AAT_TOOL_CHOICE:-}" ]; then
+  export AAT_TOOL_CHOICE
+else
+  unset AAT_TOOL_CHOICE || true
+fi
+export AAT_PARALLEL_TOOL_CALLS
 TORCH_PROFILE="${TORCH_PROFILE:-0}"
 TORCH_PROFILE_DIR="${TORCH_PROFILE_DIR:-}"
 HYBRID_RUNNER_TEMPLATE="${HYBRID_RUNNER_TEMPLATE:-}"
@@ -154,11 +171,16 @@ MISSING_EVIDENCE_REPAIR_MAX_ATTEMPTS_PER_TARGET="${MISSING_EVIDENCE_REPAIR_MAX_A
 ENABLE_EXPLICIT_FAULT_RISK_ADJUDICATION="${ENABLE_EXPLICIT_FAULT_RISK_ADJUDICATION:-0}"
 export ENABLE_MISSING_EVIDENCE_GUARD ENABLE_MISSING_EVIDENCE_REPAIR ENABLE_EXPLICIT_FAULT_RISK_ADJUDICATION
 export MISSING_EVIDENCE_REPAIR_MAX_ATTEMPTS MISSING_EVIDENCE_REPAIR_MAX_ATTEMPTS_PER_TARGET
+export ENABLE_SELF_ASK PLAN_EXECUTE_REPO_LOCAL
+export AAT_OPENAI_AGENTS_VERSION AAT_MCP_VERSION AAT_LITELLM_VERSION
+export AAT_MCP_CLIENT_TIMEOUT_SECONDS
+export AAT_RUNNER_TEMPLATE HYBRID_RUNNER_TEMPLATE VERIFIED_PE_RUNNER_TEMPLATE
 
 SERVER_IOT_PATH="${SERVER_IOT_PATH:-$REPO_ROOT/mcp_servers/iot_server/server.py}"
 SERVER_FMSR_PATH="${SERVER_FMSR_PATH:-$REPO_ROOT/mcp_servers/fmsr_server/server.py}"
 SERVER_TSFM_PATH="${SERVER_TSFM_PATH:-$REPO_ROOT/mcp_servers/tsfm_server/server.py}"
 SERVER_WO_PATH="${SERVER_WO_PATH:-$REPO_ROOT/mcp_servers/wo_server/server.py}"
+export SERVER_IOT_PATH SERVER_FMSR_PATH SERVER_TSFM_PATH SERVER_WO_PATH
 
 SCENARIO_FILES=($SCENARIOS_GLOB)
 if [ "${#SCENARIO_FILES[@]}" -eq 0 ]; then
@@ -215,8 +237,6 @@ RUN_ID="${SMARTGRID_RUN_ID:-${SLURM_JOB_ID:-local-$(date +%Y%m%d-%H%M%S)}_${EXPE
 CELL_DIR="benchmarks/$(cell_dir_name "$EXPERIMENT_CELL")"
 RAW_DIR="$CELL_DIR/raw"
 RUN_DIR="$RAW_DIR/$RUN_ID"
-mkdir -p "$RUN_DIR"
-
 CONFIG_FILE="$CELL_DIR/config.json"
 SUMMARY_FILE="$CELL_DIR/summary.json"
 META_FILE="$RUN_DIR/meta.json"
@@ -224,8 +244,326 @@ VLLM_LOG="$RUN_DIR/vllm.log"
 HARNESS_LOG="$RUN_DIR/harness.log"
 LATENCY_FILE="$RUN_DIR/latencies.jsonl"
 RESUME_MANIFEST_FILE="$RUN_DIR/resume_manifest.jsonl"
-: >"$HARNESS_LOG"
 VLLM_PGID=""
+
+prepare_previous_run_artifacts() {
+  local archive suffix index source destination path scenario_basename scenario_path trial
+  local -a snapshot_sources=(
+    "$HARNESS_LOG"
+    "$LATENCY_FILE"
+    "$RESUME_MANIFEST_FILE"
+    "$META_FILE"
+    "$VLLM_LOG"
+    "$CONFIG_FILE"
+    "$SUMMARY_FILE"
+  )
+  local -a batch_sources=()
+  local batch_selected=0
+  BATCH_PRESERVATION_READY=0
+
+  if [ "$ORCHESTRATION" = "agent_as_tool" ] && [ "$MCP_MODE" = "optimized" ] && \
+      [ "$SMARTGRID_RESUME" != "1" ]; then
+    batch_selected=1
+    for scenario_path in "${SCENARIO_FILES[@]}"; do
+      scenario_basename="$(basename "$scenario_path" .json)"
+      for trial in $(seq 1 "$TRIALS"); do
+        batch_sources+=(
+          "$RUN_DIR/${RUN_BASENAME}_${scenario_basename}_run$(printf '%02d' "$trial").json"
+        )
+      done
+    done
+    batch_sources+=("$RUN_DIR/_batch_stats.json" "$RUN_DIR/_batch_latencies.jsonl")
+  fi
+
+  for source in "${snapshot_sources[@]}"; do
+    if [ -L "$source" ]; then
+      echo "ERROR: refusing to overwrite symlinked run artifact $source." >&2
+      return 1
+    fi
+  done
+
+  local needs_archive=0
+  for source in "${snapshot_sources[@]}" "${batch_sources[@]}"; do
+    if [ -e "$source" ]; then
+      needs_archive=1
+      break
+    fi
+  done
+  if [ "$needs_archive" -eq 0 ]; then
+    BATCH_ARCHIVE_DIR=""
+    BATCH_PRESERVATION_READY=1
+    return 0
+  fi
+
+  suffix="$(date +%Y%m%dT%H%M%S)-$$"
+  index=0
+  while :; do
+    archive="$RUN_DIR/.batch-previous.$suffix"
+    if [ "$index" -gt 0 ]; then
+      archive="$archive.$index"
+    fi
+    if mkdir -- "$archive" 2>/dev/null; then
+      break
+    fi
+    if [ -e "$archive" ] || [ -L "$archive" ]; then
+      index=$((index + 1))
+      continue
+    fi
+    echo "ERROR: unable to create run artifact archive directory $archive." >&2
+    return 1
+  done
+  BATCH_ARCHIVE_DIR="$archive"
+  mkdir -- "$archive/run" "$archive/cell" "$archive/batch"
+
+  for source in "${snapshot_sources[@]}"; do
+    if [ ! -e "$source" ]; then
+      continue
+    fi
+    case "$source" in
+      "$RUN_DIR"/*) destination="$archive/run/${source##*/}" ;;
+      *) destination="$archive/cell/${source##*/}" ;;
+    esac
+    if ! cp -p -- "$source" "$destination"; then
+      echo "ERROR: unable to snapshot existing run artifact $source." >&2
+      return 1
+    fi
+  done
+
+  if [ "$batch_selected" -eq 1 ]; then
+    for path in "${batch_sources[@]}"; do
+      if [ -e "$path" ] || [ -L "$path" ]; then
+        if ! mv -- "$path" "$archive/batch/"; then
+          echo "ERROR: unable to preserve prior optimized batch artifact $path." >&2
+          return 1
+        fi
+      fi
+    done
+  fi
+  BATCH_PRESERVATION_READY=1
+}
+
+PYTHON_BIN=""
+VLLM_ACTIVATE=""
+if [ "$LAUNCH_VLLM" = "1" ]; then
+  if [ -x "$REPO_ROOT/.venv-insomnia/bin/python" ] && \
+      [ -f "$REPO_ROOT/.venv-insomnia/bin/activate" ]; then
+    PYTHON_BIN="$REPO_ROOT/.venv-insomnia/bin/python"
+    VLLM_ACTIVATE="$REPO_ROOT/.venv-insomnia/bin/activate"
+  elif [ -x "$PROJECT_ROOT/.venv-insomnia/bin/python" ] && \
+      [ -f "$PROJECT_ROOT/.venv-insomnia/bin/activate" ]; then
+    PYTHON_BIN="$PROJECT_ROOT/.venv-insomnia/bin/python"
+    VLLM_ACTIVATE="$PROJECT_ROOT/.venv-insomnia/bin/activate"
+  else
+    echo "ERROR: LAUNCH_VLLM=1 requires a usable .venv-insomnia Python and activate script." >&2
+    exit 2
+  fi
+elif [ -x "$PROJECT_ROOT/.venv/bin/python" ]; then
+  PYTHON_BIN="$PROJECT_ROOT/.venv/bin/python"
+else
+  PYTHON_BIN="$(command -v python3 || true)"
+  if [ -z "$PYTHON_BIN" ]; then
+    echo "ERROR: python3 is unavailable for runner identity." >&2
+    exit 2
+  fi
+  PYTHON_BIN="$(cd "$(dirname "$PYTHON_BIN")" && pwd -P)/$(basename "$PYTHON_BIN")"
+fi
+AOB_PYTHON="${AOB_PYTHON:-$AOB_PATH/.venv/bin/python}"
+if [ ! -x "$AOB_PYTHON" ]; then
+  AOB_PYTHON="$PYTHON_BIN"
+fi
+if [ "$LAUNCH_VLLM" = "1" ] && [ "$AAT_MCP_SERVER_LAUNCH_MODE" != "uv" ] && \
+    [ -z "$AAT_MCP_SERVER_PYTHON" ]; then
+  AAT_MCP_SERVER_PYTHON="$PYTHON_BIN"
+fi
+if [ "$MCP_MODE" != "direct" ] && [ "$AAT_MCP_SERVER_LAUNCH_MODE" != "uv" ] && \
+    [ -z "$AAT_MCP_SERVER_PYTHON" ] && [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+  AAT_MCP_SERVER_PYTHON="$REPO_ROOT/.venv/bin/python"
+fi
+if [ "$LAUNCH_VLLM" = "1" ]; then
+  export PATH=/usr/local/cuda/bin:$PATH
+  export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+  # Cluster-specific settings and the selected environment must be active
+  # before offline uv interpreter discovery.
+  # shellcheck source=scripts/insomnia_env.sh
+  source "$REPO_ROOT/scripts/insomnia_env.sh"
+  # shellcheck disable=SC1091
+  source "$VLLM_ACTIVATE"
+fi
+python_version() {
+  local version
+  version="$("$1" --version 2>&1)" || return 1
+  printf '%s\n' "$version"
+}
+resolve_uv_python() {
+  local cwd="$1"
+  (cd "$cwd" && uv python find --offline --no-python-downloads 2>/dev/null)
+}
+python_identity() {
+  "$PYTHON_BIN" "$REPO_ROOT/scripts/gcp_resume_state.py" interpreter-identity --python "$1" --version "$2"
+}
+if ! AOB_PYTHON_VERSION="$(python_version "$AOB_PYTHON")"; then
+  echo "ERROR: unable to identify the selected AssetOpsBench Python interpreter." >&2
+  exit 2
+fi
+if ! RUNNER_PYTHON_VERSION="$(python_version "$PYTHON_BIN")"; then
+  echo "ERROR: unable to identify the selected runner Python interpreter." >&2
+  exit 2
+fi
+if [ "$ORCHESTRATION" != "agent_as_tool" ] || [ "$MCP_MODE" = "direct" ]; then
+  AAT_MCP_SERVER_PYTHON_VERSION="not_applicable"
+elif [ "$AAT_MCP_SERVER_LAUNCH_MODE" = "uv" ]; then
+  AAT_MCP_SERVER_PYTHON_VERSION="uv-managed"
+elif [ -n "$AAT_MCP_SERVER_PYTHON" ]; then
+  if ! AAT_MCP_SERVER_PYTHON_VERSION="$(python_version "$AAT_MCP_SERVER_PYTHON")"; then
+    echo "ERROR: unable to identify the selected MCP server Python interpreter." >&2
+    exit 2
+  fi
+else
+  AAT_MCP_SERVER_PYTHON_VERSION="unresolved"
+fi
+if [ "$ORCHESTRATION" = "agent_as_tool" ]; then
+  AAT_UV_PYTHON="$(resolve_uv_python "$REPO_ROOT")" || {
+    echo "ERROR: unable to resolve the AaT uv interpreter offline." >&2
+    exit 2
+  }
+else
+  AAT_UV_PYTHON=""
+fi
+if [ "$ORCHESTRATION" = "plan_execute" ] && [ "$ENABLE_SELF_ASK" != "1" ] && \
+    [ "${PLAN_EXECUTE_REPO_LOCAL:-0}" != "1" ]; then
+  AOB_UV_PYTHON="$(resolve_uv_python "$AOB_PATH")" || {
+    echo "ERROR: unable to resolve the AssetOpsBench uv interpreter offline." >&2
+    exit 2
+  }
+else
+  AOB_UV_PYTHON=""
+fi
+if [ "$ORCHESTRATION" = "agent_as_tool" ] && [ "$MCP_MODE" != "direct" ] && \
+    [ "$AAT_MCP_SERVER_LAUNCH_MODE" = "uv" ]; then
+  AAT_MCP_SERVER_PYTHON_VERSION="$(python_version "$AAT_UV_PYTHON")" || {
+    echo "ERROR: unable to identify the nested AaT MCP uv interpreter." >&2
+    exit 2
+  }
+fi
+RUNNER_PYTHON_IDENTITY="$(python_identity "$PYTHON_BIN" "$RUNNER_PYTHON_VERSION")" || exit 2
+case "$ORCHESTRATION" in
+  verified_pe) AOB_PYTHON_ACTIVE=1 ;;
+  plan_execute)
+    if [ "$ENABLE_SELF_ASK" = "1" ] || [ "${PLAN_EXECUTE_REPO_LOCAL:-0}" = "1" ]; then
+      AOB_PYTHON_ACTIVE=1
+    else
+      AOB_PYTHON_ACTIVE=0
+    fi
+    ;;
+  *) AOB_PYTHON_ACTIVE=0 ;;
+esac
+if [ "$AOB_PYTHON_ACTIVE" = "1" ]; then
+  AOB_PYTHON_IDENTITY="$(python_identity "$AOB_PYTHON" "$AOB_PYTHON_VERSION")" || exit 2
+else
+  AOB_PYTHON_IDENTITY="not_applicable"
+fi
+if [ "$AAT_MCP_SERVER_PYTHON_VERSION" = "not_applicable" ]; then
+  AAT_MCP_PYTHON_IDENTITY="not_applicable"
+elif [ "$ORCHESTRATION" != "agent_as_tool" ] || [ "$MCP_MODE" = "direct" ]; then
+  AAT_MCP_PYTHON_IDENTITY="not_applicable"
+elif [ "$AAT_MCP_SERVER_LAUNCH_MODE" = "uv" ]; then
+  AAT_MCP_PYTHON_IDENTITY="$(python_identity "$AAT_UV_PYTHON" "$AAT_MCP_SERVER_PYTHON_VERSION")" || exit 2
+else
+  AAT_MCP_PYTHON_IDENTITY="$(python_identity "$AAT_MCP_SERVER_PYTHON" "$AAT_MCP_SERVER_PYTHON_VERSION")" || exit 2
+fi
+if [ -n "$AAT_UV_PYTHON" ]; then
+  AAT_UV_PYTHON_IDENTITY="$(python_identity "$AAT_UV_PYTHON" "$(python_version "$AAT_UV_PYTHON")")" || exit 2
+else
+  AAT_UV_PYTHON_IDENTITY="not_applicable"
+fi
+if [ -n "$AOB_UV_PYTHON" ]; then
+  AOB_UV_PYTHON_IDENTITY="$(python_identity "$AOB_UV_PYTHON" "$(python_version "$AOB_UV_PYTHON")")" || exit 2
+else
+  AOB_UV_PYTHON_IDENTITY="not_applicable"
+fi
+export AOB_PATH AOB_PYTHON AOB_PYTHON_VERSION RUNNER_PYTHON_VERSION
+export AAT_MCP_SERVER_PYTHON AAT_MCP_SERVER_LAUNCH_MODE AAT_MCP_SERVER_PYTHON_VERSION
+export AAT_UV_PYTHON AOB_UV_PYTHON RUNNER_PYTHON_IDENTITY AOB_PYTHON_IDENTITY
+export AAT_MCP_PYTHON_IDENTITY AAT_UV_PYTHON_IDENTITY AOB_UV_PYTHON_IDENTITY
+export AOB_PYTHON_ACTIVE
+AAT_MCP_PYTHON_PATH="not_applicable"
+if [ "$AAT_MCP_PYTHON_IDENTITY" != "not_applicable" ]; then
+  if [ "$AAT_MCP_SERVER_LAUNCH_MODE" = "uv" ]; then
+    AAT_MCP_PYTHON_PATH="$AAT_UV_PYTHON"
+  else
+    AAT_MCP_PYTHON_PATH="$AAT_MCP_SERVER_PYTHON"
+  fi
+fi
+export RUNNER_PYTHON_PATH="$PYTHON_BIN"
+export AOB_PYTHON_PATH="not_applicable"
+if [ "$AOB_PYTHON_ACTIVE" = "1" ]; then
+  export AOB_PYTHON_PATH="$AOB_PYTHON"
+fi
+export AAT_MCP_PYTHON_PATH AAT_UV_PYTHON_PATH="$AAT_UV_PYTHON" AOB_UV_PYTHON_PATH="$AOB_UV_PYTHON"
+
+# Resolve hardware identity before resume validation. A client-local GPU is
+# authoritative only when this runner launches vLLM; remote callers supply
+# GPU_TYPE from the execution host.
+if [ -z "${GPU_TYPE:-}" ]; then
+  if [ "$LAUNCH_VLLM" = "1" ] && command -v nvidia-smi >/dev/null 2>&1; then
+    if _gpu_name="$(nvidia-smi --id="${CUDA_VISIBLE_DEVICES:-0}" \
+        --query-gpu=name --format=csv,noheader 2>/dev/null)"; then
+      GPU_TYPE="$(printf '%s\n' "$_gpu_name" \
+          | head -1 \
+          | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    fi
+    unset _gpu_name
+  fi
+  GPU_TYPE="${GPU_TYPE:-unknown}"
+fi
+export GPU_TYPE
+
+if [ "$SMARTGRID_RESUME" = "1" ] && [ "$SMARTGRID_FORCE_RERUN" != "1" ]; then
+  if ! "$PYTHON_BIN" scripts/gcp_resume_state.py validate-run-identity \
+      --meta-file "$META_FILE" \
+      --run-dir "$RUN_DIR" \
+      --config-path "$CONFIG_PATH" \
+      --repo-root "$REPO_ROOT" \
+      --gpu-type "$GPU_TYPE" \
+      --enable-smartgrid-servers "$ENABLE_SMARTGRID_SERVERS" \
+      --trial-count "$TRIALS" \
+      --aob-python-version "$AOB_PYTHON_VERSION" \
+      --runner-python-version "$RUNNER_PYTHON_VERSION" \
+      --aat-mcp-server-launch-mode "$AAT_MCP_SERVER_LAUNCH_MODE" \
+      --aat-mcp-server-python-version "$AAT_MCP_SERVER_PYTHON_VERSION" \
+      --scenario-set-name "$SCENARIO_SET_NAME" \
+      --scenario-set-hash "$SCENARIO_SET_HASH" \
+      --experiment-cell "$EXPERIMENT_CELL" \
+      --orchestration-mode "$ORCHESTRATION" \
+      --mcp-mode "$MCP_MODE" \
+      --model-id "$MODEL_ID" \
+      --model-provider "$MODEL_PROVIDER" \
+      --judge-model "$JUDGE_MODEL" \
+      --context-window "$MAX_MODEL_LEN" \
+      --temperature "$TEMPERATURE" \
+      --max-tokens "$MAX_TOKENS" \
+      --serving-stack "$SERVING_STACK" \
+      --quantization-mode "$QUANTIZATION_MODE" \
+      --launch-vllm "$LAUNCH_VLLM" \
+      --vllm-model-path "$VLLM_MODEL_PATH" \
+      --vllm-served-model-name "$VLLM_SERVED_MODEL_NAME" \
+      --vllm-dtype "$VLLM_DTYPE" \
+      --vllm-generation-config "$VLLM_GENERATION_CONFIG" \
+      --vllm-tool-call-parser "$VLLM_TOOL_CALL_PARSER" \
+      --vllm-enable-auto-tool-choice "$VLLM_ENABLE_AUTO_TOOL_CHOICE" \
+      --aat-parallel-tool-calls "$AAT_PARALLEL_TOOL_CALLS" \
+      --aat-tool-choice "${AAT_TOOL_CHOICE:-}" \
+      --vllm-extra-args "$EXTRA_VLLM_ARGS"; then
+    echo "ERROR: refusing resume because run identity does not match current inputs." >&2
+    exit 2
+  fi
+fi
+mkdir -p "$RUN_DIR"
+if ! prepare_previous_run_artifacts; then
+  echo "ERROR: refusing to overwrite run artifacts because preservation failed." >&2
+  exit 2
+fi
+: >"$HARNESS_LOG"
 
 echo "=== SmartGridBench Experiment ==="
 echo "Run ID:        $RUN_ID"
@@ -245,15 +583,6 @@ echo "Resume:        $SMARTGRID_RESUME"
 echo "Force rerun:   $SMARTGRID_FORCE_RERUN"
 echo ""
 
-PYTHON_BIN="python3"
-if [ "$LAUNCH_VLLM" != "1" ] && [ -x "$PROJECT_ROOT/.venv/bin/python" ]; then
-  PYTHON_BIN="$PROJECT_ROOT/.venv/bin/python"
-fi
-AOB_PYTHON="${AOB_PYTHON:-$AOB_PATH/.venv/bin/python}"
-if [ ! -x "$AOB_PYTHON" ]; then
-  AOB_PYTHON="$PYTHON_BIN"
-fi
-
 for cmd in python3 curl uv; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "ERROR: required command not found: $cmd" >&2
@@ -261,30 +590,6 @@ for cmd in python3 curl uv; do
   fi
 done
 
-# Resolve the GPU model name once at job start so config.json / summary.json
-# stamp the actual hardware (e.g. "NVIDIA RTX A6000", "NVIDIA L40S") instead
-# of "unknown". nvidia-smi does NOT honor CUDA_VISIBLE_DEVICES on its own, so
-# we filter explicitly. Falls back to "unknown" if nvidia-smi is missing
-# (login-node / non-GPU runs, dry runs) or the query fails. Caller-provided
-# GPU_TYPE wins so smoke / replay paths can override. (#132)
-#
-# Quirk: nvidia-smi prints diagnostic messages like "No devices were found"
-# to STDOUT and exits non-zero, so we must check the exit code rather than
-# only redirecting stderr — otherwise an error message lands as the GPU
-# name in the JSON.
-if [ -z "${GPU_TYPE:-}" ]; then
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    if _gpu_name="$(nvidia-smi --id="${CUDA_VISIBLE_DEVICES:-0}" \
-        --query-gpu=name --format=csv,noheader 2>/dev/null)"; then
-      GPU_TYPE="$(printf '%s\n' "$_gpu_name" \
-          | head -1 \
-          | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-    fi
-    unset _gpu_name
-  fi
-  GPU_TYPE="${GPU_TYPE:-unknown}"
-fi
-export GPU_TYPE
 echo "GPU type: $GPU_TYPE"
 
 # Support both WatsonX env spellings across repos/tooling.
@@ -336,6 +641,7 @@ fi
 
 "$PYTHON_BIN" - "$CONFIG_FILE" "$SUMMARY_FILE" "$META_FILE" "$CONFIG_PATH" "$RUN_ID" "$WANDB_ENTITY" "$WANDB_PROJECT" "$EXPERIMENT_FAMILY" "$EXPERIMENT_CELL" "$ORCHESTRATION" "$MCP_MODE" "$TRIALS" "${#SCENARIO_FILES[@]}" "$SCENARIO_SET_NAME" "$SCENARIO_SET_HASH" "$SCENARIO_DOMAIN_SCOPE" "$MODEL_ID" "$MODEL_PROVIDER" "$SERVING_STACK" "$QUANTIZATION_MODE" "$MAX_MODEL_LEN" "$TEMPERATURE" "$MAX_TOKENS" "$JUDGE_MODEL" <<'PY'
 import importlib.metadata
+import hashlib
 import json
 import os
 import pathlib
@@ -343,7 +649,13 @@ import re
 import subprocess
 import sys
 from datetime import datetime, timezone
-
+from scripts.gcp_resume_state import (
+    _RUN_IDENTITY_FIELDS,
+    effective_behavior_identity,
+    _processed_data_sha256,
+    _runner_code_sha256,
+    _shell_flag_enabled,
+)
 (
     config_path,
     summary_path,
@@ -406,6 +718,13 @@ def command_output(args):
         ).strip()
     except Exception:
         return None
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with pathlib.Path(path).open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 def runtime_versions():
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -481,12 +800,51 @@ payload = {
     "model_provider": model_provider,
     "serving_stack": serving_stack,
     "quantization_mode": quantization_mode,
+    "launch_vllm": os.environ.get("LAUNCH_VLLM", "0"),
+    "vllm_model_path": os.environ.get(
+        "VLLM_MODEL_PATH", "models/Llama-3.1-8B-Instruct"
+    ),
+    "vllm_served_model_name": os.environ.get(
+        "VLLM_SERVED_MODEL_NAME", "Llama-3.1-8B-Instruct"
+    ),
+    "vllm_dtype": os.environ.get("VLLM_DTYPE", "float16"),
+    "vllm_generation_config": os.environ.get("VLLM_GENERATION_CONFIG", "vllm"),
+    "vllm_tool_call_parser": os.environ.get(
+        "VLLM_TOOL_CALL_PARSER", "llama3_json"
+    ),
+    "vllm_enable_auto_tool_choice": os.environ.get(
+        "VLLM_ENABLE_AUTO_TOOL_CHOICE", "1"
+    ),
+    "vllm_extra_args": os.environ.get("EXTRA_VLLM_ARGS", "").strip(),
     "context_window": int(context_window),
     "temperature": float(temperature),
     "max_tokens": int(max_tokens),
     "host_name": os.uname().nodename,
     "compute_env": "insomnia" if "SLURM_JOB_ID" in os.environ else "local",
     "gpu_type": os.environ.get("GPU_TYPE", "unknown"),
+    "enable_smartgrid_servers": _shell_flag_enabled(
+        os.environ.get("ENABLE_SMARTGRID_SERVERS", "1")
+    ),
+    "aob_python_version": os.environ.get("AOB_PYTHON_VERSION", "unknown"),
+    "aat_mcp_server_launch_mode": os.environ.get(
+        "AAT_MCP_SERVER_LAUNCH_MODE", "python"
+    ),
+    "aat_mcp_server_python_version": os.environ.get(
+        "AAT_MCP_SERVER_PYTHON_VERSION", "unknown"
+    ),
+    "runner_python_version": os.environ.get("RUNNER_PYTHON_VERSION", "unknown"),
+    "runner_interpreter_identity": os.environ.get("RUNNER_PYTHON_IDENTITY", "unresolved"),
+    "aob_interpreter_identity": os.environ.get("AOB_PYTHON_IDENTITY", "unresolved"),
+    "aat_mcp_interpreter_identity": os.environ.get("AAT_MCP_PYTHON_IDENTITY", "not_applicable"),
+    "aat_uv_interpreter_identity": os.environ.get("AAT_UV_PYTHON_IDENTITY", "not_applicable"),
+    "aob_uv_interpreter_identity": os.environ.get("AOB_UV_PYTHON_IDENTITY", "not_applicable"),
+    "python_interpreter_provenance": {
+        "runner": os.environ.get("RUNNER_PYTHON_PATH", "unknown"),
+        "assetopsbench": os.environ.get("AOB_PYTHON_PATH", "not_applicable"),
+        "aat_mcp_server": os.environ.get("AAT_MCP_PYTHON_PATH", "not_applicable"),
+        "aat_uv_context": os.environ.get("AAT_UV_PYTHON_PATH", "not_applicable"),
+        "assetopsbench_uv_context": os.environ.get("AOB_UV_PYTHON_PATH", "not_applicable"),
+    },
     "gpu_count": int(os.environ.get("SLURM_GPUS_ON_NODE", "1") or "1"),
     "runtime_owner": os.environ.get("USER"),
     "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
@@ -506,37 +864,62 @@ if os.environ.get("CONTRIBUTING_EXPERIMENTS"):
     ]
 
 if orchestration_mode == "agent_as_tool":
-    payload["aat_parallel_tool_calls"] = os.environ.get("AAT_PARALLEL_TOOL_CALLS", "false")
-payload["missing_evidence_guard"] = (
-    os.environ.get("ENABLE_MISSING_EVIDENCE_GUARD", "0").strip().lower()
-    in {"1", "true", "yes", "on"}
-)
-payload["missing_evidence_repair"] = (
-    os.environ.get("ENABLE_MISSING_EVIDENCE_REPAIR", "0").strip().lower()
-    in {"1", "true", "yes", "on"}
-)
-payload["explicit_fault_risk_adjudication"] = (
-    os.environ.get("ENABLE_EXPLICIT_FAULT_RISK_ADJUDICATION", "0").strip().lower()
-    in {"1", "true", "yes", "on"}
-)
-payload["missing_evidence_repair_max_attempts"] = int(
-    os.environ.get("MISSING_EVIDENCE_REPAIR_MAX_ATTEMPTS", "2")
-)
-payload["missing_evidence_repair_max_attempts_per_target"] = int(
-    os.environ.get("MISSING_EVIDENCE_REPAIR_MAX_ATTEMPTS_PER_TARGET", "1")
+    from scripts.aat_runner import _parse_parallel_tool_calls
+    payload["aat_parallel_tool_calls"] = _parse_parallel_tool_calls(
+        os.environ.get("AAT_PARALLEL_TOOL_CALLS", "false")
+    )
+    payload["aat_tool_choice"] = os.environ.get("AAT_TOOL_CHOICE") or None
+else:
+    payload["aat_parallel_tool_calls"] = None
+    payload["aat_tool_choice"] = None
+payload.update(
+    effective_behavior_identity(
+        orchestration_mode=orchestration_mode,
+        enable_smartgrid_servers=os.environ.get("ENABLE_SMARTGRID_SERVERS", "1"),
+        missing_evidence_guard=os.environ.get("ENABLE_MISSING_EVIDENCE_GUARD", "0"),
+        missing_evidence_repair=os.environ.get("ENABLE_MISSING_EVIDENCE_REPAIR", "0"),
+        explicit_fault_risk_adjudication=os.environ.get(
+            "ENABLE_EXPLICIT_FAULT_RISK_ADJUDICATION", "0"
+        ),
+        missing_evidence_repair_max_attempts=os.environ.get(
+            "MISSING_EVIDENCE_REPAIR_MAX_ATTEMPTS", "2"
+        ),
+        missing_evidence_repair_max_attempts_per_target=os.environ.get(
+            "MISSING_EVIDENCE_REPAIR_MAX_ATTEMPTS_PER_TARGET", "1"
+        ),
+        enable_self_ask=os.environ.get("ENABLE_SELF_ASK", "0"),
+        plan_execute_repo_local=os.environ.get("PLAN_EXECUTE_REPO_LOCAL", "0"),
+        aat_openai_agents_version=os.environ.get("AAT_OPENAI_AGENTS_VERSION", "0.14.5"),
+        aat_mcp_version=os.environ.get("AAT_MCP_VERSION", "1.27.0"),
+        aat_litellm_version=os.environ.get("AAT_LITELLM_VERSION", "1.81.13"),
+        aat_mcp_client_timeout_seconds=os.environ.get(
+            "AAT_MCP_CLIENT_TIMEOUT_SECONDS", "30"
+        ),
+        aat_runner_template=os.environ.get("AAT_RUNNER_TEMPLATE", ""),
+        hybrid_runner_template=os.environ.get("HYBRID_RUNNER_TEMPLATE", ""),
+        verified_pe_runner_template=os.environ.get("VERIFIED_PE_RUNNER_TEMPLATE", ""),
+        server_iot_path=os.environ.get("SERVER_IOT_PATH", ""),
+        server_fmsr_path=os.environ.get("SERVER_FMSR_PATH", ""),
+        server_tsfm_path=os.environ.get("SERVER_TSFM_PATH", ""),
+        server_wo_path=os.environ.get("SERVER_WO_PATH", ""),
+    )
 )
 
-# Persist EXTRA_VLLM_ARGS into the benchmark config + meta so artifact
+# Persist effective vLLM settings into the benchmark config + meta so artifact
 # consumers (notebooks, WandB, paper tables) can recover the exact vLLM
 # optimization knobs that produced a run without re-reading harness.log.
 # Lane 2 / #30 specifically needs this for the prefix-cache / kv-dtype
 # distinction in Cell C.
-extra_vllm_args = os.environ.get("EXTRA_VLLM_ARGS", "").strip()
-payload["vllm_dtype"] = os.environ.get("VLLM_DTYPE", "float16")
-payload["vllm_generation_config"] = os.environ.get("VLLM_GENERATION_CONFIG", "vllm")
-payload["vllm_extra_args"] = extra_vllm_args
+extra_vllm_args = payload["vllm_extra_args"]
 payload["vllm_extra_args_list"] = extra_vllm_args.split() if extra_vllm_args else []
 payload["runtime_versions"] = runtime_versions()
+payload["config_source_sha256"] = file_sha256(benchmark_config_path)
+payload["runner_code_sha256"] = _runner_code_sha256(pathlib.Path.cwd())
+payload["processed_data_sha256"] = _processed_data_sha256(pathlib.Path.cwd())
+payload["run_identity"] = {
+    key: payload[key]
+    for key in _RUN_IDENTITY_FIELDS
+}
 
 pathlib.Path(config_path).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 pathlib.Path(meta_path).write_text(
@@ -576,6 +959,10 @@ pathlib.Path(meta_path).write_text(
             "vllm_extra_args": payload["vllm_extra_args"],
             "vllm_extra_args_list": payload["vllm_extra_args_list"],
             "runtime_versions": payload["runtime_versions"],
+            "config_source_sha256": payload["config_source_sha256"],
+            "runner_code_sha256": payload["runner_code_sha256"],
+            "run_identity": payload["run_identity"],
+            "python_interpreter_provenance": payload["python_interpreter_provenance"],
             "git_sha": payload["git_sha"],
             "git_branch": payload["git_branch"],
             "git_dirty": payload["git_dirty"],
@@ -594,16 +981,6 @@ pathlib.Path(meta_path).write_text(
 PY
 
 if [ "$LAUNCH_VLLM" = "1" ]; then
-  export PATH=/usr/local/cuda/bin:$PATH
-  export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
-  # Cluster-specific env (NCCL overrides for Insomnia Slingshot fabric, etc.)
-  # shellcheck source=scripts/insomnia_env.sh
-  source "$REPO_ROOT/scripts/insomnia_env.sh"
-  # shellcheck disable=SC1091
-  source .venv-insomnia/bin/activate
-  if [ "$AAT_MCP_SERVER_LAUNCH_MODE" != "uv" ] && [ -z "$AAT_MCP_SERVER_PYTHON" ] && [ -x "$REPO_ROOT/.venv-insomnia/bin/python" ]; then
-    export AAT_MCP_SERVER_PYTHON="$REPO_ROOT/.venv-insomnia/bin/python"
-  fi
   CUDNN_LIB="$("$PYTHON_BIN" -c 'import nvidia.cudnn, os; print(os.path.join(os.path.dirname(nvidia.cudnn.__file__), "lib"))' 2>/dev/null || true)"
   if [ -n "$CUDNN_LIB" ]; then
     export LD_LIBRARY_PATH="$CUDNN_LIB:$LD_LIBRARY_PATH"
@@ -679,7 +1056,7 @@ run_plan_execute_trial() {
     run_json_stdout_trial "$out_path" "$REPO_ROOT" "${wrapper_cmd[@]}"
     return
   fi
-  local -a cmd=(uv run plan-execute --json --model-id "$MODEL_ID")
+  local -a cmd=(uv run --python "$AOB_UV_PYTHON" plan-execute --json --model-id "$MODEL_ID")
   if [ "$HARNESS_VERBOSE" = "1" ]; then
     cmd+=(--verbose --show-plan --show-trajectory)
   fi
@@ -805,7 +1182,7 @@ preflight_aat_runtime_dependencies() {
 
   if ! (
     cd "$REPO_ROOT"
-    uv run \
+    uv run --python "$AAT_UV_PYTHON" \
       --with "openai-agents==$AAT_OPENAI_AGENTS_VERSION" \
       --with "mcp[cli]==$AAT_MCP_VERSION" \
       --with "litellm==$AAT_LITELLM_VERSION" \
@@ -834,10 +1211,20 @@ PY
 
   if [ "$MCP_MODE" != "direct" ]; then
     echo "AaT MCP server launch mode: $AAT_MCP_SERVER_LAUNCH_MODE" >>"$HARNESS_LOG"
+    # The cluster path exports AAT_MCP_SERVER_PYTHON from .venv-insomnia, but a
+    # non-cluster run never reaches that block, so launch mode "python" used to
+    # hard-fail even where the repo's own .venv already provides the MCP server
+    # deps. Fall back to it only when nothing else was chosen. Explicit
+    # AAT_MCP_SERVER_PYTHON and the uv launch mode are both left untouched, and
+    # this installs nothing.
+    if [ "$AAT_MCP_SERVER_LAUNCH_MODE" != "uv" ] && [ -z "$AAT_MCP_SERVER_PYTHON" ] && [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+      export AAT_MCP_SERVER_PYTHON="$REPO_ROOT/.venv/bin/python"
+      echo "AaT MCP server python: falling back to repo .venv" >>"$HARNESS_LOG"
+    fi
     if [ "$AAT_MCP_SERVER_LAUNCH_MODE" = "uv" ]; then
       if ! (
         cd "$REPO_ROOT"
-        uv run \
+        uv run --python "$AAT_UV_PYTHON" \
           --with "mcp[cli]==$AAT_MCP_VERSION" \
           --with pandas \
           --with numpy \
@@ -882,7 +1269,7 @@ PY
       return 1
     elif ! (
       cd "$REPO_ROOT"
-      uv run \
+      uv run --python "$AAT_UV_PYTHON" \
         --with "mcp[cli]==$AAT_MCP_VERSION" \
         --with pandas \
         --with numpy \
@@ -953,7 +1340,7 @@ run_agent_as_tool_trial() {
   fi
 
   local -a cmd=(
-    uv run
+    uv run --python "$AAT_UV_PYTHON"
     --with "openai-agents==$AAT_OPENAI_AGENTS_VERSION"
     --with "mcp[cli]==$AAT_MCP_VERSION"
     --with "litellm==$AAT_LITELLM_VERSION"
@@ -976,7 +1363,7 @@ run_agent_as_tool_batch() {
   export AAT_MCP_SERVER_PYTHON AAT_MCP_SERVER_LAUNCH_MODE AAT_MCP_CLIENT_TIMEOUT_SECONDS
 
   local -a cmd=(
-    uv run
+    uv run --python "$AAT_UV_PYTHON"
     --with "openai-agents==$AAT_OPENAI_AGENTS_VERSION"
     --with "mcp[cli]==$AAT_MCP_VERSION"
     --with "litellm==$AAT_LITELLM_VERSION"
@@ -993,6 +1380,22 @@ run_agent_as_tool_batch() {
     cmd+=(--verbose)
   fi
   (cd "$REPO_ROOT" && "${cmd[@]}") >>"$HARNESS_LOG" 2>&1
+}
+
+optimized_batch_infrastructure_failure() {
+  local batch_rc="$1"
+  local stats_present="$2"
+  local infrastructure_errors="$3"
+  if [ "$infrastructure_errors" -gt 0 ]; then
+    return 0
+  fi
+  if [ "$batch_rc" -ne 0 ] && {
+    [ "$batch_rc" -ne 1 ] || [ "$stats_present" -ne 1 ]
+  }; then
+    return 0
+  fi
+  [ "$stats_present" -eq 1 ] || return 0
+  return 1
 }
 
 run_verified_pe_trial() {
@@ -1183,6 +1586,29 @@ TOTAL=0
 RESUME_SKIPPED=0
 RESUME_RERUN=0
 INFRA_FAIL=0
+INFRASTRUCTURE_ERRORS=0
+BATCH_MODE=0
+SUMMARY_OUTPUTS=()
+append_summary_output() {
+  local candidate="$1"
+  local existing
+  for existing in "${SUMMARY_OUTPUTS[@]}"; do
+    if [ "$existing" = "$candidate" ]; then
+      return 0
+    fi
+  done
+  SUMMARY_OUTPUTS+=("$candidate")
+}
+record_infrastructure_error() {
+  INFRASTRUCTURE_ERRORS=$((INFRASTRUCTURE_ERRORS + 1))
+  INFRA_FAIL=1
+}
+record_batch_infrastructure_failure() {
+  INFRA_FAIL=1
+  if [ "$INFRASTRUCTURE_ERRORS" -eq 0 ]; then
+    INFRASTRUCTURE_ERRORS=1
+  fi
+}
 if [ "$SMARTGRID_RESUME" = "1" ] && [ "$SMARTGRID_FORCE_RERUN" != "1" ]; then
   touch "$LATENCY_FILE"
 else
@@ -1193,38 +1619,84 @@ fi
 # Cell C optimized: run all scenarios in a single aat_runner.py call so MCP
 # subprocesses are reused across trials (reuse_mcp_connections).
 if [ "$ORCHESTRATION" = "agent_as_tool" ] && [ "$MCP_MODE" = "optimized" ] && [ "$SMARTGRID_RESUME" != "1" ]; then
+  BATCH_MODE=1
   if [ -n "${AAT_RUNNER_TEMPLATE:-}" ]; then
     echo "ERROR: AAT_RUNNER_TEMPLATE is not supported with MCP_MODE=optimized batch mode." >&2
     exit 1
   fi
   EXPECTED_TOTAL=$(( ${#SCENARIO_FILES[@]} * TRIALS ))
   BATCH_RC=0
-  run_agent_as_tool_batch "$RUN_DIR" || BATCH_RC=$?
-  if [ "$BATCH_RC" -gt 1 ]; then
-    echo "ERROR: agent-as-tool batch runner failed with exit code $BATCH_RC" >&2
-    INFRA_FAIL=1
+  BATCH_ARTIFACTS_FRESH=0
+  if [ "$BATCH_PRESERVATION_READY" = "1" ]; then
+    BATCH_ARTIFACTS_FRESH=1
+    run_agent_as_tool_batch "$RUN_DIR" || BATCH_RC=$?
+  else
+    BATCH_RC=2
   fi
-  # Merge per-trial latency records into the canonical latencies.jsonl.
-  if [ -f "$RUN_DIR/_batch_latencies.jsonl" ]; then
-    cat "$RUN_DIR/_batch_latencies.jsonl" >>"$LATENCY_FILE"
-  fi
-  # Count pass/fail — RUN_BASENAME prefix safely excludes meta.json etc.
-  for trial_json in "$RUN_DIR/${RUN_BASENAME}"_*.json; do
-    [ -f "$trial_json" ] || continue
-    TOTAL=$((TOTAL + 1))
-    if trial_succeeded "$trial_json"; then
-      PASS=$((PASS + 1))
+  BATCH_STATS_PRESENT=0
+  if [ "$BATCH_ARTIFACTS_FRESH" -eq 1 ]; then
+    if [ -f "$RUN_DIR/_batch_stats.json" ]; then
+      if BATCH_STATS_SHELL=$("$PYTHON_BIN" - "$RUN_DIR/_batch_stats.json" <<'PY'
+import json
+import shlex
+import sys
+
+payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
+if not isinstance(payload, dict):
+    raise SystemExit("batch stats must be a JSON object")
+value = payload.get("infrastructure_errors")
+if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    raise SystemExit("batch infrastructure_errors must be a nonnegative integer")
+print(f"INFRASTRUCTURE_ERRORS={shlex.quote(str(value))}")
+PY
+      ); then
+        eval "$BATCH_STATS_SHELL"
+        BATCH_STATS_PRESENT=1
+      else
+        echo "ERROR: unable to parse fresh optimized batch stats." >&2
+        record_infrastructure_error
+      fi
     else
-      FAIL=$((FAIL + 1))
+      echo "ERROR: fresh optimized batch run produced no batch stats." >&2
+      record_infrastructure_error
     fi
-  done
-  # Account for trials that never wrote output (e.g. MCP crash before any JSON).
-  MISSING=$(( EXPECTED_TOTAL - TOTAL ))
-  if [ "$MISSING" -gt 0 ]; then
-    echo "WARNING: $MISSING trial(s) missing from batch output — counting as failures" >&2
-    FAIL=$(( FAIL + MISSING ))
-    TOTAL=$(( TOTAL + MISSING ))
-    INFRA_FAIL=1
+  else
+    echo "ERROR: optimized batch preservation failed; no fresh stats are available." >&2
+  fi
+  if [ "$BATCH_ARTIFACTS_FRESH" -eq 1 ]; then
+    if optimized_batch_infrastructure_failure \
+        "$BATCH_RC" "$BATCH_STATS_PRESENT" "$INFRASTRUCTURE_ERRORS"; then
+      echo "ERROR: optimized batch runner failed with exit code $BATCH_RC or reported infrastructure errors." >&2
+      record_batch_infrastructure_failure
+    fi
+    if [ -f "$RUN_DIR/_batch_latencies.jsonl" ]; then
+      cat "$RUN_DIR/_batch_latencies.jsonl" >>"$LATENCY_FILE"
+    fi
+    for SCENARIO_FILE in "${SCENARIO_FILES[@]}"; do
+      SCENARIO_BASENAME="$(basename "$SCENARIO_FILE" .json)"
+      for TRIAL in $(seq 1 "$TRIALS"); do
+        trial_json="$RUN_DIR/${RUN_BASENAME}_${SCENARIO_BASENAME}_run$(printf '%02d' "$TRIAL").json"
+        if [ -f "$trial_json" ]; then
+          append_summary_output "$trial_json"
+          TOTAL=$((TOTAL + 1))
+          if trial_succeeded "$trial_json"; then
+            PASS=$((PASS + 1))
+          else
+            FAIL=$((FAIL + 1))
+          fi
+        else
+          echo "WARNING: missing fresh batch output $trial_json — counting as failure" >&2
+          FAIL=$((FAIL + 1))
+          TOTAL=$((TOTAL + 1))
+          record_infrastructure_error
+        fi
+      done
+    done
+  else
+    echo "ERROR: optimized batch freshness preservation failed; prior outputs were not read." >&2
+    record_infrastructure_error
+    FAIL=$((FAIL + EXPECTED_TOTAL))
+    TOTAL=$((TOTAL + EXPECTED_TOTAL))
   fi
 else
 
@@ -1247,17 +1719,27 @@ PY
     RESUME_REASON="fresh_run"
 
     if [ "$SMARTGRID_RESUME" = "1" ] && [ "$SMARTGRID_FORCE_RERUN" != "1" ]; then
+      RESUME_STATE="incomplete"
+      RESUME_COMPLETE=0
+      RESUME_SUCCESS=0
+      RESUME_OUTPUT_PATH="$TRIAL_OUT"
+      RESUME_REASON="resume_status_unavailable"
       REQUIRE_LATENCY_ARGS=()
       if [ "$SMARTGRID_RESUME_REQUIRE_LATENCY" = "1" ]; then
         REQUIRE_LATENCY_ARGS+=(--require-latency)
       fi
-      eval "$("$PYTHON_BIN" scripts/gcp_resume_state.py trial-status-shell \
+      if RESUME_SHELL_VARS=$("$PYTHON_BIN" scripts/gcp_resume_state.py trial-status-shell \
         --run-dir "$RUN_DIR" \
         --scenario-file "$SCENARIO_FILE" \
         --trial-index "$TRIAL" \
         --output-path "$TRIAL_OUT" \
         --latency-file "$LATENCY_FILE" \
-        "${REQUIRE_LATENCY_ARGS[@]}")"
+        "${REQUIRE_LATENCY_ARGS[@]}"); then
+        eval "$RESUME_SHELL_VARS"
+      else
+        echo "ERROR: resume status helper failed for $TRIAL_ID; rerunning with an infrastructure failure recorded." >&2
+        record_infrastructure_error
+      fi
       TRIAL_OUT="$RESUME_OUTPUT_PATH"
       TRIAL_TMP="${TRIAL_OUT}.tmp"
       if [ "$RESUME_COMPLETE" = "1" ]; then
@@ -1267,37 +1749,52 @@ PY
         else
           FAIL=$((FAIL + 1))
         fi
-        "$PYTHON_BIN" scripts/gcp_resume_state.py manifest-event \
-          --manifest-file "$RESUME_MANIFEST_FILE" \
-          --state "$RESUME_STATE" \
-          --scenario-file "$SCENARIO_FILE" \
-          --trial-index "$TRIAL" \
-          --output-path "$TRIAL_OUT" \
-          --run-name "$RUN_ID" \
-          --reason "resume_skip:$RESUME_REASON" \
-          --batch-id "$SMARTGRID_BATCH_ID"
+        append_summary_output "$TRIAL_OUT"
+        if ! "$PYTHON_BIN" scripts/gcp_resume_state.py manifest-event \
+            --manifest-file "$RESUME_MANIFEST_FILE" \
+            --state "$RESUME_STATE" \
+            --scenario-file "$SCENARIO_FILE" \
+            --trial-index "$TRIAL" \
+            --output-path "$TRIAL_OUT" \
+            --run-name "$RUN_ID" \
+            --reason "resume_skip:$RESUME_REASON" \
+            --batch-id "$SMARTGRID_BATCH_ID"; then
+          echo "ERROR: resume manifest helper failed for $TRIAL_ID." >&2
+          record_infrastructure_error
+          continue
+        fi
         echo "Resume skip: $TRIAL_ID ($RESUME_STATE)"
         continue
       fi
       RESUME_RERUN=$((RESUME_RERUN + 1))
     fi
 
-    "$PYTHON_BIN" scripts/gcp_resume_state.py preserve-incomplete \
-      --output-path "$TRIAL_OUT" \
-      --manifest-file "$RESUME_MANIFEST_FILE" \
-      --scenario-file "$SCENARIO_FILE" \
-      --trial-index "$TRIAL" \
-      --run-name "$RUN_ID" \
-      --batch-id "$SMARTGRID_BATCH_ID" \
-      --reason "pre_rerun_incomplete:$RESUME_REASON" || true
-    "$PYTHON_BIN" scripts/gcp_resume_state.py preserve-incomplete \
-      --output-path "$TRIAL_TMP" \
-      --manifest-file "$RESUME_MANIFEST_FILE" \
-      --scenario-file "$SCENARIO_FILE" \
-      --trial-index "$TRIAL" \
-      --run-name "$RUN_ID" \
-      --batch-id "$SMARTGRID_BATCH_ID" \
-      --reason "pre_rerun_tmp" || true
+    if ! "$PYTHON_BIN" scripts/gcp_resume_state.py preserve-incomplete \
+        --output-path "$TRIAL_OUT" \
+        --manifest-file "$RESUME_MANIFEST_FILE" \
+        --scenario-file "$SCENARIO_FILE" \
+        --trial-index "$TRIAL" \
+        --run-name "$RUN_ID" \
+        --batch-id "$SMARTGRID_BATCH_ID" \
+        --reason "pre_rerun_incomplete:$RESUME_REASON"; then
+      echo "ERROR: failed to preserve existing trial output for $TRIAL_ID." >&2
+      record_infrastructure_error
+      FAIL=$((FAIL + 1))
+      continue
+    fi
+    if ! "$PYTHON_BIN" scripts/gcp_resume_state.py preserve-incomplete \
+        --output-path "$TRIAL_TMP" \
+        --manifest-file "$RESUME_MANIFEST_FILE" \
+        --scenario-file "$SCENARIO_FILE" \
+        --trial-index "$TRIAL" \
+        --run-name "$RUN_ID" \
+        --batch-id "$SMARTGRID_BATCH_ID" \
+        --reason "pre_rerun_tmp"; then
+      echo "ERROR: failed to clear prior temporary output for $TRIAL_ID." >&2
+      record_infrastructure_error
+      FAIL=$((FAIL + 1))
+      continue
+    fi
 
     START_EPOCH="$("$PYTHON_BIN" - <<'PY'
 import time
@@ -1331,30 +1828,44 @@ print(time.time())
 PY
 )"
 
-    eval "$("$PYTHON_BIN" scripts/gcp_resume_state.py finalize-trial-shell \
-      --scenario-file "$SCENARIO_FILE" \
-      --trial-index "$TRIAL" \
-      --temp-output "$TRIAL_TMP" \
-      --output-path "$TRIAL_OUT" \
-      --latency-file "$LATENCY_FILE" \
-      --manifest-file "$RESUME_MANIFEST_FILE" \
-      --run-name "$RUN_ID" \
-      --batch-id "$SMARTGRID_BATCH_ID" \
-      --start-epoch "$START_EPOCH" \
-      --end-epoch "$END_EPOCH" \
-      --return-code "$TRIAL_RC")"
+    FINAL_STATE="incomplete"
+    FINAL_SUCCESS=0
+    FINAL_REASON="finalization_unavailable"
+    if FINAL_SHELL_VARS=$("$PYTHON_BIN" scripts/gcp_resume_state.py finalize-trial-shell \
+        --scenario-file "$SCENARIO_FILE" \
+        --trial-index "$TRIAL" \
+        --temp-output "$TRIAL_TMP" \
+        --output-path "$TRIAL_OUT" \
+        --latency-file "$LATENCY_FILE" \
+        --manifest-file "$RESUME_MANIFEST_FILE" \
+        --run-name "$RUN_ID" \
+        --batch-id "$SMARTGRID_BATCH_ID" \
+        --start-epoch "$START_EPOCH" \
+        --end-epoch "$END_EPOCH" \
+        --return-code "$TRIAL_RC"); then
+      eval "$FINAL_SHELL_VARS"
+    else
+      echo "ERROR: trial finalization failed for $TRIAL_ID." >&2
+      record_infrastructure_error
+    fi
 
-    if [ "$FINAL_SUCCESS" = "1" ]; then
+    if [ "$FINAL_STATE" = "incomplete" ]; then
+      FAIL=$((FAIL + 1))
+    elif [ "$FINAL_SUCCESS" = "1" ]; then
       PASS=$((PASS + 1))
+      append_summary_output "$TRIAL_OUT"
     else
       FAIL=$((FAIL + 1))
+      if [ -f "$TRIAL_OUT" ]; then
+        append_summary_output "$TRIAL_OUT"
+      fi
     fi
   done
 done
 
 fi  # end of per-scenario/per-trial loop (skipped for MCP_MODE=optimized batch path)
 
-"$PYTHON_BIN" - "$SUMMARY_FILE" "$CONFIG_FILE" "$META_FILE" "$LATENCY_FILE" "$RUN_DIR" "$PASS" "$FAIL" "$TOTAL" "$RESUME_SKIPPED" "$RESUME_RERUN" <<'PY'
+"$PYTHON_BIN" - "$SUMMARY_FILE" "$CONFIG_FILE" "$META_FILE" "$LATENCY_FILE" "$RUN_DIR" "$PASS" "$FAIL" "$TOTAL" "$RESUME_SKIPPED" "$RESUME_RERUN" "$INFRA_FAIL" "$INFRASTRUCTURE_ERRORS" "${SUMMARY_OUTPUTS[@]}" <<'PY'
 import json
 import pathlib
 import statistics
@@ -1372,7 +1883,10 @@ from datetime import datetime, timezone
     total,
     resume_skipped,
     resume_rerun,
-) = sys.argv[1:]
+    infrastructure_failure,
+    infrastructure_errors,
+) = sys.argv[1:13]
+requested_output_paths = [pathlib.Path(raw) for raw in sys.argv[13:]]
 config = json.loads(pathlib.Path(config_path).read_text(encoding="utf-8"))
 meta = json.loads(pathlib.Path(meta_path).read_text(encoding="utf-8"))
 latency_records = [
@@ -1405,7 +1919,7 @@ input_tokens_total = 0
 output_tokens_total = 0
 total_tokens_total = 0
 usage_trials = 0
-for output_path in sorted(pathlib.Path(run_dir).glob("*_run[0-9][0-9].json")):
+for output_path in sorted(requested_output_paths):
     try:
         payload = json.loads(output_path.read_text(encoding="utf-8"))
     except Exception:
@@ -1463,6 +1977,12 @@ def percentile(values, p):
     idx = min(len(values) - 1, round((p / 100) * (len(values) - 1)))
     return values[idx]
 
+infrastructure_failure_value = bool(int(infrastructure_failure))
+if infrastructure_failure_value:
+    run_status = "partial" if int(passed) > 0 else "failed"
+else:
+    run_status = "success" if int(failed) == 0 else ("partial" if int(passed) > 0 else "failed")
+
 summary = {
     **{
         k: config[k]
@@ -1493,11 +2013,13 @@ summary = {
     "explicit_fault_risk_adjudication": bool(config.get("explicit_fault_risk_adjudication", False)),
     "missing_evidence_repair_max_attempts": config.get("missing_evidence_repair_max_attempts"),
     "missing_evidence_repair_max_attempts_per_target": config.get("missing_evidence_repair_max_attempts_per_target"),
-    "run_status": "success" if int(failed) == 0 else ("partial" if int(passed) > 0 else "failed"),
+    "run_status": run_status,
     "scenarios_attempted": int(total),
     "scenarios_completed": int(passed),
     "resume_skipped_count": int(resume_skipped),
     "resume_rerun_count": int(resume_rerun),
+    "infrastructure_error_count": int(infrastructure_errors),
+    "infrastructure_failure": infrastructure_failure_value,
     "success_rate": (int(passed) / int(total)) if int(total) else 0.0,
     "failure_count": int(failed),
     "wall_clock_seconds_total": wall_clock_seconds_total,
@@ -1542,6 +2064,8 @@ meta["run_status"] = summary["run_status"]
 meta["mcp_setup_seconds"] = summary["mcp_setup_seconds"]
 meta["resume_skipped_count"] = summary["resume_skipped_count"]
 meta["resume_rerun_count"] = summary["resume_rerun_count"]
+meta["infrastructure_error_count"] = summary["infrastructure_error_count"]
+meta["infrastructure_failure"] = summary["infrastructure_failure"]
 pathlib.Path(meta_path).write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 PY
 

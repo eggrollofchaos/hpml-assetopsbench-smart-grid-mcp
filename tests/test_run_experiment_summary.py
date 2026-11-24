@@ -88,6 +88,8 @@ def test_summary_includes_batch_mcp_setup_once(tmp_path):
             "2",
             "0",
             "0",
+            "0",
+            "0",
         ],
         check=True,
     )
@@ -138,6 +140,8 @@ def test_summary_records_null_mcp_setup_when_absent(tmp_path):
             "1",
             "0",
             "1",
+            "0",
+            "0",
             "0",
             "0",
         ],
@@ -225,6 +229,15 @@ def test_summary_aggregates_token_usage_when_trials_report_it(tmp_path):
             "requests": 4,
         },
     )
+    _write_trial(
+        run_dir,
+        name="2026-04-28_C_llama_agent_as_tool_optimized_unrequested_run01.json",
+        usage={
+            "input_tokens": 10000,
+            "output_tokens": 20000,
+            "total_tokens": 30000,
+        },
+    )
 
     subprocess.run(
         [
@@ -241,6 +254,14 @@ def test_summary_aggregates_token_usage_when_trials_report_it(tmp_path):
             "2",
             "0",
             "0",
+            "0",
+            "0",
+            str(
+                run_dir / "2026-04-28_C_llama_agent_as_tool_optimized_scenA_run01.json"
+            ),
+            str(
+                run_dir / "2026-04-28_C_llama_agent_as_tool_optimized_scenA_run02.json"
+            ),
         ],
         check=True,
     )
@@ -305,6 +326,9 @@ def test_summary_token_fields_null_when_no_trial_reports_usage(tmp_path):
             "1",
             "0",
             "0",
+            "0",
+            "0",
+            str(run_dir / "2026-04-28_legacy_run01.json"),
         ],
         check=True,
     )
@@ -351,6 +375,8 @@ def test_summary_records_resume_skip_and_rerun_counts(tmp_path):
             "3",
             "2",
             "1",
+            "0",
+            "0",
         ],
         check=True,
     )
@@ -366,3 +392,45 @@ def test_summary_records_resume_skip_and_rerun_counts(tmp_path):
     assert summary["run_status"] == "partial"
     assert meta["resume_skipped_count"] == 2
     assert meta["resume_rerun_count"] == 1
+
+
+def test_summary_infrastructure_failure_cannot_report_success(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    summary_py = _extract_summary_python(repo_root)
+    summary_path = tmp_path / "summary.json"
+    config_path = tmp_path / "config.json"
+    meta_path = tmp_path / "meta.json"
+    latency_path = tmp_path / "latencies.jsonl"
+    run_dir = tmp_path / "raw" / "test-run"
+    run_dir.mkdir(parents=True)
+    config_path.write_text(
+        json.dumps(_base_config(summary_path), indent=2) + "\n", encoding="utf-8"
+    )
+    meta_path.write_text(json.dumps({"started_at": "now"}) + "\n", encoding="utf-8")
+    latency_path.write_text("", encoding="utf-8")
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            summary_py,
+            str(summary_path),
+            str(config_path),
+            str(meta_path),
+            str(latency_path),
+            str(run_dir),
+            "1",
+            "0",
+            "1",
+            "0",
+            "0",
+            "1",
+            "0",
+        ],
+        check=True,
+    )
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert summary["run_status"] == "partial"
+    assert summary["infrastructure_failure"] is True
+    assert meta["run_status"] == "partial"

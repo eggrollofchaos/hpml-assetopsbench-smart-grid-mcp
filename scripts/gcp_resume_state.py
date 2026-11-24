@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -41,6 +42,19 @@ def _norm(path: Path | str) -> str:
 
 def _shell_bool(value: bool) -> str:
     return "1" if value else "0"
+
+
+def _flag_enabled(value: str | bool | None) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _shell_flag_enabled(value: str | bool | None) -> bool:
+    """Mirror the wrapper's exact 1/0 switch semantics for identity fields."""
+    if isinstance(value, bool):
+        return value
+    return str(value or "") == "1"
 
 
 def _emit_shell(values: dict[str, Any]) -> None:
@@ -180,6 +194,44 @@ def derive_success(data: dict[str, Any]) -> bool | None:
     return bool(data.get("answer"))
 
 
+def _is_infrastructure_error_payload(data: dict[str, Any]) -> bool:
+    """Identify rerunnable runner exceptions without masking model failures."""
+    if (
+        data.get("infrastructure_error") is True
+        or data.get("state") == "infrastructure_error"
+    ):
+        return True
+    error = data.get("error")
+    if "error" in data and (not isinstance(error, str) or not error.strip()):
+        return True
+    if _is_terminal_model_failure_payload(data):
+        return False
+    return bool(data.get("error"))
+
+
+_LEGACY_MODEL_ERROR_MARKERS = (
+    "maxturnsexceeded",
+    "max turns exceeded",
+    "modelbehaviorerror",
+    "model behavior error",
+)
+
+
+def _is_terminal_model_failure_payload(data: dict[str, Any]) -> bool:
+    """Recognize current and known historical terminal model failures."""
+    if data.get("infrastructure_error") is True:
+        return False
+    error = data.get("error")
+    if "error" in data and (not isinstance(error, str) or not error.strip()):
+        return False
+    if data.get("model_error") is True or data.get("max_turns_exhausted") is True:
+        return isinstance(error, str) and bool(error.strip())
+    if isinstance(error, str):
+        error_class = error.partition(":")[0].strip().casefold().replace("_", " ")
+        return error_class in _LEGACY_MODEL_ERROR_MARKERS
+    return data.get("state") == "complete_failure" or data.get("success") is False
+
+
 def _scenario_id_matches(
     payload: dict[str, Any],
     scenario: dict[str, Any],
@@ -190,6 +242,488 @@ def _scenario_id_matches(
     expected_id = scenario.get("id")
     actual_id = embedded.get("id")
     return not expected_id or not actual_id or expected_id == actual_id
+
+
+_RUN_IDENTITY_FIELDS = (
+    "config_source_sha256",
+    "runner_code_sha256",
+    "processed_data_sha256",
+    "git_sha",
+    "missing_evidence_guard",
+    "missing_evidence_repair",
+    "explicit_fault_risk_adjudication",
+    "missing_evidence_repair_max_attempts",
+    "missing_evidence_repair_max_attempts_per_target",
+    "enable_self_ask",
+    "plan_execute_repo_local",
+    "aat_openai_agents_version",
+    "aat_mcp_version",
+    "aat_litellm_version",
+    "aat_mcp_client_timeout_seconds",
+    "runner_template_sha256",
+    "server_iot_sha256",
+    "server_fmsr_sha256",
+    "server_tsfm_sha256",
+    "server_wo_sha256",
+    "gpu_type",
+    "scenario_set_name",
+    "scenario_set_hash",
+    "trial_count",
+    "experiment_cell",
+    "orchestration_mode",
+    "mcp_mode",
+    "model_id",
+    "model_provider",
+    "judge_model",
+    "context_window",
+    "temperature",
+    "max_tokens",
+    "serving_stack",
+    "quantization_mode",
+    "launch_vllm",
+    "vllm_model_path",
+    "vllm_served_model_name",
+    "vllm_dtype",
+    "vllm_generation_config",
+    "vllm_tool_call_parser",
+    "vllm_enable_auto_tool_choice",
+    "vllm_extra_args",
+    "enable_smartgrid_servers",
+    "aat_parallel_tool_calls",
+    "aat_tool_choice",
+    "aob_python_version",
+    "aat_mcp_server_launch_mode",
+    "aat_mcp_server_python_version",
+    "runner_python_version",
+    "runner_interpreter_identity",
+    "aob_interpreter_identity",
+    "aat_mcp_interpreter_identity",
+    "aat_uv_interpreter_identity",
+    "aob_uv_interpreter_identity",
+)
+
+_RUNNER_CODE_FILES = (
+    "scripts/run_experiment.sh",
+    "scripts/gcp_resume_state.py",
+    "scripts/aat_runner.py",
+    "scripts/aat_system_prompt.py",
+    "scripts/aat_tools_direct.py",
+    "scripts/aat_tools_mcp.py",
+    "scripts/aat_mcp_server_bootstrap.py",
+    "scripts/watsonx_env.py",
+    "scripts/orchestration_utils.py",
+    "scripts/plan_execute_self_ask_runner.py",
+    "scripts/verified_pe_runner.py",
+    "scripts/mitigation_guards.py",
+    "mcp_servers/direct_adapter.py",
+    "mcp_servers/base.py",
+    "mcp_servers/iot_server/server.py",
+    "mcp_servers/fmsr_server/server.py",
+    "mcp_servers/tsfm_server/server.py",
+    "mcp_servers/wo_server/server.py",
+)
+
+
+def _git_revision(repo_root: Path) -> str | None:
+    return _command_output(["git", "-C", str(repo_root), "rev-parse", "HEAD"])
+
+
+def _git_dirty(repo_root: Path) -> bool | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "diff-index", "--quiet", "HEAD", "--"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode == 0:
+        return False
+    if result.returncode == 1:
+        return True
+    return None
+
+
+def _runner_code_sha256(repo_root: Path) -> str | None:
+    digest = hashlib.sha256()
+    for relative in _RUNNER_CODE_FILES:
+        path = repo_root / relative
+        if not path.is_file():
+            return None
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _processed_data_sha256(repo_root: Path) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    for path in sorted((repo_root / "data" / "processed").glob("*.csv")):
+        digest = _sha256(path)
+        if digest is None:
+            raise ValueError(f"processed data is unreadable: {path}")
+        hashes[path.relative_to(repo_root).as_posix()] = digest
+    return hashes
+
+
+def normalize_aat_client_timeout_seconds(value: str | float) -> float:
+    raw = str(value).strip()
+    try:
+        timeout = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"AAT_MCP_CLIENT_TIMEOUT_SECONDS must be numeric, got {raw!r}"
+        ) from exc
+    if timeout <= 0:
+        raise ValueError(f"AAT_MCP_CLIENT_TIMEOUT_SECONDS must be > 0, got {timeout!r}")
+    return timeout
+
+
+def interpreter_identity(python_path: Path, version: str) -> dict[str, str]:
+    """Bind an executable's bytes and reported runtime without host-path equality."""
+    try:
+        candidate = str(python_path)
+        if not python_path.is_absolute() and len(python_path.parts) == 1:
+            found = shutil.which(candidate)
+            if found is None:
+                raise FileNotFoundError(candidate)
+            python_path = Path(found)
+        resolved = python_path.resolve(strict=True)
+        digest = _sha256(resolved)
+    except OSError as exc:
+        raise ValueError(
+            f"selected Python interpreter is unavailable: {python_path}: {exc}"
+        ) from exc
+    if digest is None or not resolved.is_file():
+        raise ValueError(f"selected Python interpreter is unreadable: {python_path}")
+    label = version.strip()
+    if not label:
+        raise ValueError(
+            f"selected Python interpreter version is unavailable: {python_path}"
+        )
+    return {"version": label, "binary_sha256": digest}
+
+
+def effective_behavior_identity(
+    *,
+    orchestration_mode: str,
+    enable_smartgrid_servers: str | bool = "1",
+    missing_evidence_guard: str | bool = "0",
+    missing_evidence_repair: str | bool = "0",
+    explicit_fault_risk_adjudication: str | bool = "0",
+    missing_evidence_repair_max_attempts: str | int = "2",
+    missing_evidence_repair_max_attempts_per_target: str | int = "1",
+    enable_self_ask: str | bool = "0",
+    plan_execute_repo_local: str | bool = "0",
+    aat_openai_agents_version: str = "0.14.5",
+    aat_mcp_version: str = "1.27.0",
+    aat_litellm_version: str = "1.81.13",
+    aat_mcp_client_timeout_seconds: str | float = "30",
+    aat_runner_template: str = "",
+    hybrid_runner_template: str = "",
+    verified_pe_runner_template: str = "",
+    server_iot_path: str = "",
+    server_fmsr_path: str = "",
+    server_tsfm_path: str = "",
+    server_wo_path: str = "",
+) -> dict[str, Any]:
+    from scripts.mitigation_guards import env_flag_enabled
+
+    repair_enabled = env_flag_enabled(missing_evidence_repair)
+    if repair_enabled:
+        try:
+            repair_attempts = int(missing_evidence_repair_max_attempts)
+            repair_per_target = int(missing_evidence_repair_max_attempts_per_target)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "missing-evidence repair attempts must be positive integers"
+            ) from exc
+        if repair_attempts < 1 or repair_per_target < 1:
+            raise ValueError(
+                "missing-evidence repair attempts must be positive integers"
+            )
+    else:
+        repair_attempts = 0
+        repair_per_target = 0
+
+    if orchestration_mode == "agent_as_tool":
+        selected_template = aat_runner_template
+    elif orchestration_mode == "verified_pe":
+        selected_template = verified_pe_runner_template
+    elif orchestration_mode == "hybrid":
+        selected_template = hybrid_runner_template
+    else:
+        selected_template = ""
+    template_hash = (
+        hashlib.sha256(selected_template.encode("utf-8")).hexdigest()
+        if selected_template
+        else None
+    )
+    uses_aat = orchestration_mode == "agent_as_tool"
+    server_hashes = {
+        "server_iot_sha256": server_iot_path,
+        "server_fmsr_sha256": server_fmsr_path,
+        "server_tsfm_sha256": server_tsfm_path,
+        "server_wo_sha256": server_wo_path,
+    }
+    external_template_consumes_overrides = bool(selected_template)
+    native_runner_consumes_overrides = orchestration_mode == "verified_pe" or (
+        orchestration_mode == "plan_execute"
+        and (
+            _shell_flag_enabled(enable_self_ask)
+            or _shell_flag_enabled(plan_execute_repo_local)
+        )
+    )
+    selected_server_overrides = (
+        external_template_consumes_overrides or native_runner_consumes_overrides
+    )
+    if selected_server_overrides:
+        for field, raw_path in tuple(server_hashes.items()):
+            if not raw_path:
+                raise ValueError(f"selected server source is unavailable: {field}")
+            source = Path(raw_path).resolve()
+            if not source.is_file():
+                raise ValueError(f"selected server source is unreadable: {source}")
+            digest = _sha256(source)
+            if digest is None:
+                raise ValueError(f"selected server source is unreadable: {source}")
+            server_hashes[field] = digest
+    else:
+        server_hashes = {field: None for field in server_hashes}
+    return {
+        "missing_evidence_guard": env_flag_enabled(missing_evidence_guard),
+        "missing_evidence_repair": repair_enabled,
+        "explicit_fault_risk_adjudication": env_flag_enabled(
+            explicit_fault_risk_adjudication
+        ),
+        "missing_evidence_repair_max_attempts": repair_attempts,
+        "missing_evidence_repair_max_attempts_per_target": repair_per_target,
+        "enable_self_ask": _shell_flag_enabled(enable_self_ask),
+        "plan_execute_repo_local": _shell_flag_enabled(plan_execute_repo_local),
+        "aat_openai_agents_version": aat_openai_agents_version if uses_aat else None,
+        "aat_mcp_version": aat_mcp_version if uses_aat else None,
+        "aat_litellm_version": aat_litellm_version if uses_aat else None,
+        "aat_mcp_client_timeout_seconds": (
+            normalize_aat_client_timeout_seconds(aat_mcp_client_timeout_seconds)
+            if uses_aat
+            else None
+        ),
+        "runner_template_sha256": template_hash,
+        **server_hashes,
+    }
+
+
+def build_run_identity(
+    *,
+    config_path: Path,
+    repo_root: Path,
+    gpu_type: str = "unknown",
+    enable_smartgrid_servers: str | bool = "1",
+    scenario_set_name: str,
+    scenario_set_hash: str,
+    trial_count: int = 1,
+    experiment_cell: str,
+    orchestration_mode: str,
+    mcp_mode: str,
+    model_id: str,
+    model_provider: str,
+    judge_model: str | None,
+    context_window: int,
+    temperature: float,
+    max_tokens: int,
+    serving_stack: str = "unknown",
+    quantization_mode: str = "none",
+    launch_vllm: str = "0",
+    vllm_model_path: str = "models/Llama-3.1-8B-Instruct",
+    vllm_served_model_name: str = "Llama-3.1-8B-Instruct",
+    vllm_dtype: str = "float16",
+    vllm_generation_config: str = "vllm",
+    vllm_tool_call_parser: str = "llama3_json",
+    vllm_enable_auto_tool_choice: str = "1",
+    vllm_extra_args: str = "",
+    aat_parallel_tool_calls: str | bool | None = "false",
+    aat_tool_choice: str | None = None,
+    missing_evidence_guard: str | bool = "0",
+    missing_evidence_repair: str | bool = "0",
+    explicit_fault_risk_adjudication: str | bool = "0",
+    missing_evidence_repair_max_attempts: str | int = "2",
+    missing_evidence_repair_max_attempts_per_target: str | int = "1",
+    enable_self_ask: str | bool = "0",
+    plan_execute_repo_local: str | bool = "0",
+    aat_openai_agents_version: str = "0.14.5",
+    aat_mcp_version: str = "1.27.0",
+    aat_litellm_version: str = "1.81.13",
+    aat_mcp_client_timeout_seconds: str | float = "30",
+    aat_runner_template: str = "",
+    hybrid_runner_template: str = "",
+    verified_pe_runner_template: str = "",
+    server_iot_path: str = "",
+    server_fmsr_path: str = "",
+    server_tsfm_path: str = "",
+    server_wo_path: str = "",
+    aob_python_version: str = "unknown",
+    aat_mcp_server_launch_mode: str = "python",
+    aat_mcp_server_python_version: str = "unknown",
+    runner_python_version: str = "unknown",
+) -> dict[str, Any]:
+    config_source_sha256 = _sha256(config_path)
+    runner_code_sha256 = _runner_code_sha256(repo_root)
+    git_sha = _git_revision(repo_root)
+    git_dirty = _git_dirty(repo_root)
+    if config_source_sha256 is None:
+        raise ValueError(f"config source is unreadable: {config_path}")
+    if runner_code_sha256 is None:
+        raise ValueError(f"runner code is unreadable: {repo_root}")
+    if git_sha is None:
+        raise ValueError(f"git revision is unavailable: {repo_root}")
+    if git_dirty is None:
+        raise ValueError(f"git dirty state is unavailable: {repo_root}")
+    if orchestration_mode == "agent_as_tool":
+        from scripts.aat_runner import _parse_parallel_tool_calls
+
+        effective_parallel_tool_calls = _parse_parallel_tool_calls(
+            str(aat_parallel_tool_calls)
+        )
+        if aat_tool_choice not in {None, "auto", "required", "none"}:
+            raise ValueError(f"invalid AAT tool-choice setting: {aat_tool_choice!r}")
+        effective_tool_choice = aat_tool_choice or None
+    else:
+        effective_parallel_tool_calls = None
+        effective_tool_choice = None
+    behavior_identity = effective_behavior_identity(
+        orchestration_mode=orchestration_mode,
+        enable_smartgrid_servers=enable_smartgrid_servers,
+        missing_evidence_guard=missing_evidence_guard,
+        missing_evidence_repair=missing_evidence_repair,
+        explicit_fault_risk_adjudication=explicit_fault_risk_adjudication,
+        missing_evidence_repair_max_attempts=missing_evidence_repair_max_attempts,
+        missing_evidence_repair_max_attempts_per_target=missing_evidence_repair_max_attempts_per_target,
+        enable_self_ask=enable_self_ask,
+        plan_execute_repo_local=plan_execute_repo_local,
+        aat_openai_agents_version=aat_openai_agents_version,
+        aat_mcp_version=aat_mcp_version,
+        aat_litellm_version=aat_litellm_version,
+        aat_mcp_client_timeout_seconds=aat_mcp_client_timeout_seconds,
+        aat_runner_template=aat_runner_template,
+        hybrid_runner_template=hybrid_runner_template,
+        verified_pe_runner_template=verified_pe_runner_template,
+        server_iot_path=server_iot_path,
+        server_fmsr_path=server_fmsr_path,
+        server_tsfm_path=server_tsfm_path,
+        server_wo_path=server_wo_path,
+    )
+    return {
+        "config_source_sha256": config_source_sha256,
+        "runner_code_sha256": runner_code_sha256,
+        "processed_data_sha256": _processed_data_sha256(repo_root),
+        "git_sha": git_sha,
+        "git_dirty": git_dirty,
+        "gpu_type": gpu_type.strip() or "unknown",
+        "scenario_set_name": scenario_set_name,
+        "scenario_set_hash": scenario_set_hash,
+        "trial_count": int(trial_count),
+        "experiment_cell": experiment_cell,
+        "orchestration_mode": orchestration_mode,
+        "mcp_mode": mcp_mode,
+        "model_id": model_id,
+        "model_provider": model_provider,
+        "judge_model": judge_model or None,
+        "context_window": int(context_window),
+        "temperature": float(temperature),
+        "max_tokens": int(max_tokens),
+        "serving_stack": serving_stack,
+        "quantization_mode": quantization_mode,
+        "launch_vllm": launch_vllm,
+        "vllm_model_path": vllm_model_path,
+        "vllm_served_model_name": vllm_served_model_name,
+        "vllm_dtype": vllm_dtype,
+        "vllm_generation_config": vllm_generation_config,
+        "vllm_tool_call_parser": vllm_tool_call_parser,
+        "vllm_enable_auto_tool_choice": vllm_enable_auto_tool_choice,
+        "vllm_extra_args": vllm_extra_args,
+        "enable_smartgrid_servers": _shell_flag_enabled(enable_smartgrid_servers),
+        "aat_parallel_tool_calls": effective_parallel_tool_calls,
+        "aat_tool_choice": effective_tool_choice,
+        "aob_python_version": aob_python_version,
+        "aat_mcp_server_launch_mode": aat_mcp_server_launch_mode,
+        "aat_mcp_server_python_version": aat_mcp_server_python_version,
+        "runner_python_version": runner_python_version,
+        "runner_interpreter_identity": os.environ.get(
+            "RUNNER_PYTHON_IDENTITY", "unresolved"
+        ),
+        "aob_interpreter_identity": os.environ.get("AOB_PYTHON_IDENTITY", "unresolved"),
+        "aat_mcp_interpreter_identity": os.environ.get(
+            "AAT_MCP_PYTHON_IDENTITY", "not_applicable"
+        ),
+        "aat_uv_interpreter_identity": os.environ.get(
+            "AAT_UV_PYTHON_IDENTITY", "not_applicable"
+        ),
+        "aob_uv_interpreter_identity": os.environ.get(
+            "AOB_UV_PYTHON_IDENTITY", "not_applicable"
+        ),
+        **behavior_identity,
+    }
+
+
+def _stored_run_identity(meta: dict[str, Any]) -> dict[str, Any] | None:
+    identity = meta.get("run_identity")
+    if not isinstance(identity, dict):
+        return None
+    return identity
+
+
+def validate_resume_identity(
+    *,
+    meta_file: Path,
+    run_dir: Path,
+    expected: dict[str, Any],
+) -> dict[str, Any]:
+    """Refuse resume when existing artifacts lack an exact immutable identity."""
+    if not run_dir.exists():
+        return {"validated": False, "reason": "new_run"}
+    try:
+        has_artifacts = next(run_dir.iterdir(), None) is not None
+    except OSError as exc:
+        raise ValueError(f"run directory is unreadable: {run_dir}: {exc}") from exc
+    if not has_artifacts:
+        return {"validated": False, "reason": "empty_run_directory"}
+
+    gpu_type = expected.get("gpu_type")
+    if not isinstance(gpu_type, str) or gpu_type.strip().casefold() in {
+        "",
+        "unknown",
+        "unavailable",
+        "none",
+        "null",
+    }:
+        raise ValueError(
+            "resume hardware identity unavailable; set GPU_TYPE to the "
+            "actual benchmark execution GPU before reusing artifacts"
+        )
+
+    meta, error = _load_json_object(meta_file)
+    if error is not None or meta is None:
+        raise ValueError(f"resume identity unavailable: {meta_file}: {error}")
+    actual = _stored_run_identity(meta)
+    if actual is None:
+        raise ValueError(f"resume identity missing: {meta_file}")
+
+    missing_fields = [field for field in _RUN_IDENTITY_FIELDS if field not in actual]
+    if missing_fields:
+        fields = ", ".join(sorted(missing_fields))
+        raise ValueError(f"resume identity missing required fields ({fields})")
+
+    mismatches = {
+        field: {"stored": actual[field], "current": expected.get(field)}
+        for field in _RUN_IDENTITY_FIELDS
+        if field != "git_sha"
+        if actual[field] != expected.get(field)
+    }
+    if mismatches:
+        fields = ", ".join(sorted(mismatches))
+        raise ValueError(f"resume identity mismatch ({fields})")
+    return {"validated": True, "reason": "exact_identity"}
 
 
 def _latency_records(latency_file: Path) -> list[dict[str, Any]]:
@@ -290,6 +824,9 @@ def classify_trial(
             continue
         if not _scenario_id_matches(payload, scenario):
             incomplete_reasons.append("scenario_identity_conflict")
+            continue
+        if _is_infrastructure_error_payload(payload):
+            incomplete_reasons.append("infrastructure_error_payload")
             continue
         success = derive_success(payload)
         if success is None:
@@ -458,33 +995,45 @@ def write_manifest_event(
 
 
 def preserve_incomplete_output(output_path: Path) -> Path | None:
-    if not output_path.exists():
+    if not output_path.exists() and not output_path.is_symlink():
         return None
     suffix = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    preserved = output_path.with_name(f"{output_path.name}.incomplete.{suffix}")
-    output_path.replace(preserved)
+    base = output_path.with_name(f"{output_path.name}.incomplete.{suffix}")
+    preserved = base
+    index = 1
+    while True:
+        try:
+            os.link(output_path, preserved, follow_symlinks=False)
+            break
+        except FileExistsError:
+            preserved = base.with_name(f"{base.name}.{index}")
+            index += 1
+    output_path.unlink()
     return preserved
 
 
 def _apply_final_answer_guards(payload: dict[str, Any]) -> None:
-    try:
-        from scripts.mitigation_guards import (  # type: ignore
-            apply_explicit_fault_risk_adjudication,
-            apply_missing_evidence_final_answer_guard,
-            env_flag_enabled,
-        )
-    except ImportError:
+    missing_evidence_enabled = _flag_enabled(
+        os.environ.get("ENABLE_MISSING_EVIDENCE_GUARD")
+    )
+    explicit_adjudication_enabled = _flag_enabled(
+        os.environ.get("ENABLE_EXPLICIT_FAULT_RISK_ADJUDICATION")
+    )
+    if not (missing_evidence_enabled or explicit_adjudication_enabled):
         return
+    from scripts.mitigation_guards import (  # type: ignore
+        apply_explicit_fault_risk_adjudication,
+        apply_missing_evidence_final_answer_guard,
+    )
+
     apply_missing_evidence_final_answer_guard(
         payload,
-        enabled=env_flag_enabled(os.environ.get("ENABLE_MISSING_EVIDENCE_GUARD")),
+        enabled=missing_evidence_enabled,
     )
     if "fault_risk_adjudication" not in payload:
         apply_explicit_fault_risk_adjudication(
             payload,
-            enabled=env_flag_enabled(
-                os.environ.get("ENABLE_EXPLICIT_FAULT_RISK_ADJUDICATION")
-            ),
+            enabled=explicit_adjudication_enabled,
         )
 
 
@@ -549,6 +1098,42 @@ def finalize_trial(
             "state": "incomplete",
             "success": False,
             "reason": error or "invalid_json",
+        }
+
+    if int(return_code) != 0 and not (
+        int(return_code) == 1 and payload.get("success") is False
+    ):
+        reason = f"execution_failed:{int(return_code)}"
+        write_manifest_event(
+            manifest_file=manifest_file,
+            state="incomplete",
+            scenario_file=scenario_file,
+            trial_index=trial_index,
+            output_path=output_path,
+            run_name=run_name,
+            reason=reason,
+            batch_id=batch_id,
+            return_code=return_code,
+        )
+        return {"state": "incomplete", "success": False, "reason": reason}
+
+    if _is_infrastructure_error_payload(payload):
+        write_manifest_event(
+            manifest_file=manifest_file,
+            state="incomplete",
+            scenario_file=scenario_file,
+            trial_index=trial_index,
+            output_path=output_path,
+            run_name=run_name,
+            reason="infrastructure_error_payload",
+            batch_id=batch_id,
+            return_code=return_code,
+        )
+        return {
+            "state": "incomplete",
+            "success": False,
+            "reason": "infrastructure_error_payload",
+            "infrastructure_error": True,
         }
 
     scenario = _scenario_payload(scenario_file)
@@ -627,6 +1212,46 @@ def _build_parser() -> argparse.ArgumentParser:
     status.add_argument("--latency-file", required=True, type=Path)
     status.add_argument("--require-latency", action="store_true")
 
+    identity = sub.add_parser("validate-run-identity")
+    identity.add_argument("--meta-file", required=True, type=Path)
+    identity.add_argument("--run-dir", required=True, type=Path)
+    identity.add_argument("--config-path", required=True, type=Path)
+    identity.add_argument("--repo-root", required=True, type=Path)
+    identity.add_argument("--gpu-type", required=True)
+    identity.add_argument("--enable-smartgrid-servers", required=True)
+    identity.add_argument("--trial-count", required=True, type=int)
+    identity.add_argument("--aob-python-version", required=True)
+    identity.add_argument("--aat-mcp-server-launch-mode", required=True)
+    identity.add_argument("--aat-mcp-server-python-version", required=True)
+    identity.add_argument("--runner-python-version", required=True)
+    identity.add_argument("--scenario-set-name", required=True)
+    identity.add_argument("--scenario-set-hash", required=True)
+    identity.add_argument("--experiment-cell", required=True)
+    identity.add_argument("--orchestration-mode", required=True)
+    identity.add_argument("--mcp-mode", required=True)
+    identity.add_argument("--model-id", required=True)
+    identity.add_argument("--model-provider", required=True)
+    identity.add_argument("--judge-model", default="")
+    identity.add_argument("--context-window", required=True, type=int)
+    identity.add_argument("--temperature", required=True, type=float)
+    identity.add_argument("--max-tokens", required=True, type=int)
+    identity.add_argument("--serving-stack", default="unknown")
+    identity.add_argument("--quantization-mode", default="none")
+    identity.add_argument("--launch-vllm", default="0")
+    identity.add_argument("--vllm-model-path", default="models/Llama-3.1-8B-Instruct")
+    identity.add_argument("--vllm-served-model-name", default="Llama-3.1-8B-Instruct")
+    identity.add_argument("--vllm-dtype", default="float16")
+    identity.add_argument("--vllm-generation-config", default="vllm")
+    identity.add_argument("--vllm-tool-call-parser", default="llama3_json")
+    identity.add_argument("--vllm-enable-auto-tool-choice", default="1")
+    identity.add_argument("--vllm-extra-args", default="")
+    identity.add_argument("--aat-parallel-tool-calls", default="false")
+    identity.add_argument("--aat-tool-choice", default="")
+
+    interpreter = sub.add_parser("interpreter-identity")
+    interpreter.add_argument("--python", required=True, type=Path)
+    interpreter.add_argument("--version", required=True)
+
     preserve = sub.add_parser("preserve-incomplete")
     preserve.add_argument("--output-path", required=True, type=Path)
     preserve.add_argument("--manifest-file", required=True, type=Path)
@@ -670,6 +1295,93 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _build_parser().parse_args()
+    if args.command == "interpreter-identity":
+        try:
+            payload = interpreter_identity(args.python, args.version)
+        except ValueError as exc:
+            print(f"gcp_resume_state: ERROR: {exc}", file=sys.stderr)
+            raise SystemExit(2)
+        print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        return
+    if args.command == "validate-run-identity":
+        try:
+            expected = build_run_identity(
+                config_path=args.config_path,
+                repo_root=args.repo_root,
+                gpu_type=args.gpu_type,
+                enable_smartgrid_servers=args.enable_smartgrid_servers,
+                scenario_set_name=args.scenario_set_name,
+                scenario_set_hash=args.scenario_set_hash,
+                trial_count=args.trial_count,
+                aob_python_version=args.aob_python_version,
+                aat_mcp_server_launch_mode=args.aat_mcp_server_launch_mode,
+                aat_mcp_server_python_version=args.aat_mcp_server_python_version,
+                runner_python_version=args.runner_python_version,
+                experiment_cell=args.experiment_cell,
+                orchestration_mode=args.orchestration_mode,
+                mcp_mode=args.mcp_mode,
+                model_id=args.model_id,
+                model_provider=args.model_provider,
+                judge_model=args.judge_model,
+                context_window=args.context_window,
+                temperature=args.temperature,
+                max_tokens=args.max_tokens,
+                serving_stack=args.serving_stack,
+                quantization_mode=args.quantization_mode,
+                launch_vllm=args.launch_vllm,
+                vllm_model_path=args.vllm_model_path,
+                vllm_served_model_name=args.vllm_served_model_name,
+                vllm_dtype=args.vllm_dtype,
+                vllm_generation_config=args.vllm_generation_config,
+                vllm_tool_call_parser=args.vllm_tool_call_parser,
+                vllm_enable_auto_tool_choice=args.vllm_enable_auto_tool_choice,
+                vllm_extra_args=args.vllm_extra_args,
+                aat_parallel_tool_calls=args.aat_parallel_tool_calls,
+                aat_tool_choice=args.aat_tool_choice or None,
+                missing_evidence_guard=os.environ.get(
+                    "ENABLE_MISSING_EVIDENCE_GUARD", "0"
+                ),
+                missing_evidence_repair=os.environ.get(
+                    "ENABLE_MISSING_EVIDENCE_REPAIR", "0"
+                ),
+                explicit_fault_risk_adjudication=os.environ.get(
+                    "ENABLE_EXPLICIT_FAULT_RISK_ADJUDICATION", "0"
+                ),
+                missing_evidence_repair_max_attempts=os.environ.get(
+                    "MISSING_EVIDENCE_REPAIR_MAX_ATTEMPTS", "2"
+                ),
+                missing_evidence_repair_max_attempts_per_target=os.environ.get(
+                    "MISSING_EVIDENCE_REPAIR_MAX_ATTEMPTS_PER_TARGET", "1"
+                ),
+                enable_self_ask=os.environ.get("ENABLE_SELF_ASK", "0"),
+                plan_execute_repo_local=os.environ.get("PLAN_EXECUTE_REPO_LOCAL", "0"),
+                aat_openai_agents_version=os.environ.get(
+                    "AAT_OPENAI_AGENTS_VERSION", "0.14.5"
+                ),
+                aat_mcp_version=os.environ.get("AAT_MCP_VERSION", "1.27.0"),
+                aat_litellm_version=os.environ.get("AAT_LITELLM_VERSION", "1.81.13"),
+                aat_mcp_client_timeout_seconds=os.environ.get(
+                    "AAT_MCP_CLIENT_TIMEOUT_SECONDS", "30"
+                ),
+                aat_runner_template=os.environ.get("AAT_RUNNER_TEMPLATE", ""),
+                hybrid_runner_template=os.environ.get("HYBRID_RUNNER_TEMPLATE", ""),
+                verified_pe_runner_template=os.environ.get(
+                    "VERIFIED_PE_RUNNER_TEMPLATE", ""
+                ),
+                server_iot_path=os.environ.get("SERVER_IOT_PATH", ""),
+                server_fmsr_path=os.environ.get("SERVER_FMSR_PATH", ""),
+                server_tsfm_path=os.environ.get("SERVER_TSFM_PATH", ""),
+                server_wo_path=os.environ.get("SERVER_WO_PATH", ""),
+            )
+            validate_resume_identity(
+                meta_file=args.meta_file,
+                run_dir=args.run_dir,
+                expected=expected,
+            )
+        except ValueError as exc:
+            print(f"gcp_resume_state: ERROR: {exc}", file=sys.stderr)
+            raise SystemExit(2)
+        return
     if args.command == "trial-status-shell":
         result = classify_trial(
             run_dir=args.run_dir,
@@ -724,6 +1436,8 @@ def main() -> None:
                 "FINAL_REASON": result["reason"],
             }
         )
+        if result["state"] == "incomplete":
+            raise SystemExit(1)
         return
     if args.command == "manifest-event":
         write_manifest_event(
