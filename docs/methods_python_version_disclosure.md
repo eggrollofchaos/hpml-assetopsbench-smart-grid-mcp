@@ -28,9 +28,13 @@ canonical: true
 >
 > The interpreter version difference is confined to the orchestration client.
 > The model server (vLLM 0.19.0 serving Llama-3.1-8B-Instruct), the four MCP
-> servers (`iot`, `fmsr`, `tsfm`, `wo`), the scenario slice, and the decoding
-> parameters (`temperature=0.0`, `max_tokens=0`) are identical across all
-> conditions. Wall-clock measurements include model inference time and MCP
+> servers (`iot`, `fmsr`, `tsfm`, `wo`), and the scenario slice are shared across
+> conditions. Temperature is configured at 0.0, but output-token limits are
+> not equivalent: `MAX_TOKENS=0` makes AaT omit an explicit cap, whereas the
+> pinned AssetOpsBench Plan-Execute backend requests 2048 output tokens even
+> when the repo-local override is omitted. This difference is a limitation of
+> cross-arm comparisons, not evidence that the arms use the same decoding
+> settings. Wall-clock measurements include model inference time and MCP
 > tool execution time, which dominate orchestration-client interpreter
 > overhead by approximately two orders of magnitude on the workloads we
 > measure: per-trial wall clocks range from ≈12 s (Cell A direct) to ≈90 s
@@ -72,6 +76,8 @@ appear before those tables, not after.
 - Do not claim the version skew is unmeasurable; just claim it is dominated
   by other factors. Reviewers may ask for a strict-parity ablation; we have
   the wrapper to produce one if needed.
+- Do not claim AaT and Plan-Execute use identical output-token limits when
+  `MAX_TOKENS=0` is configured.
 
 ## TODO before paper-final
 

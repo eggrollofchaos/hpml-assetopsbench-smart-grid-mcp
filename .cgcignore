@@ -128,4 +128,5 @@ scripts/scan_errors.py
 scripts/sprint_project_root.py
 scripts/summarize_json.py
 scripts/sync_cgcignore.py
+scripts/validate_frontmatter_matrix.py
 # END cgcignore escaping-symlinks

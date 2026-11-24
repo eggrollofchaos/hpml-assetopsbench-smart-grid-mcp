@@ -8,6 +8,31 @@ canonical: true
 # Changelog
 
 
+## 2026-11-14
+
+### Fixed
+
+- Corrected failure-taxonomy hallucination polarity to match the judge rubric,
+  with regression coverage for both boolean values. Existing result files are
+  preserved; regenerated analysis remains a separate step.
+- Bound hand-audit replay to the auto labels originally reviewed, preserving
+  the historical decisions and refusing mismatched labels before writing results.
+- Corrected metadata on existing audit documents so repository validation passes.
+- Hardened failure-evidence reports to preserve BOM-prefixed YAML frontmatter and reject unterminated metadata before report overwrite.
+- Preserved raw TSFM anomaly argument types across direct and MCP paths, validated trend-bound precision, and normalized mixed-offset timestamps while retaining timezone-aware values.
+- Protected prior outputs during resume, bound run identity to effective behavior and selected interpreters, and preserved terminal trial data for classification.
+
+## 2026-09-24
+
+### Added
+
+- Added the failure-taxonomy polarity repair closeout at
+  `docs/retrospectives/2026-09-24_failure-taxonomy-polarity-closeout.md`,
+  documenting the `dim_hallucinations` correction, focused regression, and
+  scratch-only historical impact check.
+- Added the EVD-009 resume-provenance and exit-propagation closeout at
+  `docs/retrospectives/2026-09-24_evd009-resume-provenance-and-exit-propagation-closeout.md`.
+
 ## 2026-06-09
 
 ### Added

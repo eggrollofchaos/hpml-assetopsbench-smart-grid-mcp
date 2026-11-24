@@ -544,7 +544,7 @@ One line of `results/metrics/scenario_scores.jsonl` (truncated):
 }
 ```
 
-`dim_hallucinations` is inverted: `false` = good (no hallucinations detected).
+`dim_hallucinations` is an occurrence signal: `false` means no hallucinations were detected; `true` means hallucination failure.
 The score formula sums the five "good when true" dims plus `(NOT hallucinations)`
 divided by 6; pass threshold is 0.6 (4 of 6).
 
@@ -685,7 +685,9 @@ for cell in sorted(agg):
 ### 15.2 `results/metrics/failure_taxonomy_current.csv` — paper-grade failures
 
 Built by `scripts/build_failure_taxonomy.py` from the JSONL above; rows are
-the *failures* (any `dim_*` was false). Columns of interest:
+the *failures* (`pass` is `False`). Positive-criterion dimensions fail when
+false; `dim_hallucinations` is an occurrence signal and fails when true.
+Columns of interest:
 
 | Column | Meaning |
 |---|---|
@@ -695,6 +697,12 @@ the *failures* (any `dim_*` was false). Columns of interest:
 | `audit_decision` / `audit_decision_source` | Hand-audit override (see PR #197) |
 | `berkeley_label` | Final Berkeley taxonomy label after audit |
 | `failure_stage` | planning / tool selection / tool execution / verification / final answer |
+
+The hand-audit sidecar binds each decision to the `auto_taxonomy_label` reviewed.
+`scripts/audit_failure_taxonomy.py add-columns` defaults to
+`data/audit/issue194_decisions_labelbound.tsv`, preserving replay of the existing
+decisions when their labels match. Corrected generator labels require fresh human
+review and updated label bindings; mismatched or unbound decisions are refused.
 
 The current canon (post PR #197) contains roughly **1.97k failure rows** of
 which ~**1.28k** are `paper_eligible=True` — i.e. the "paper-grade failures"

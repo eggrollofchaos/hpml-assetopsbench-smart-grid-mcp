@@ -120,24 +120,8 @@ scripts:
     scope: project
     project: hpml-assetopsbench-smart-grid-mcp
     work-items: [WORK-AGT-492]
-  scripts/check_kb_frontmatter.py:
-    title: Check Kb Frontmatter
-    type: script
-    status: live
-    owner: Wei Alexander Xin
-    scope: project
-    project: hpml-assetopsbench-smart-grid-mcp
-    work-items: [WORK-AGT-492]
   scripts/check_pr_scope.py:
     title: Check Pr Scope
-    type: script
-    status: live
-    owner: Wei Alexander Xin
-    scope: project
-    project: hpml-assetopsbench-smart-grid-mcp
-    work-items: [WORK-AGT-492]
-  scripts/check_skill_frontmatter.py:
-    title: Check Skill Frontmatter
     type: script
     status: live
     owner: Wei Alexander Xin
@@ -522,6 +506,14 @@ scripts:
     work-items: [WORK-AGT-492]
   scripts/sync_cgcignore.py:
     title: Sync Cgcignore
+    type: script
+    status: live
+    owner: Wei Alexander Xin
+    scope: project
+    project: hpml-assetopsbench-smart-grid-mcp
+    work-items: [WORK-AGT-492]
+  scripts/validate_frontmatter_matrix.py:
+    title: Validate Frontmatter Matrix
     type: script
     status: live
     owner: Wei Alexander Xin
