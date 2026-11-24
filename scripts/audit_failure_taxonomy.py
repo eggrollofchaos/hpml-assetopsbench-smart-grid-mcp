@@ -18,15 +18,15 @@ Subcommands:
     briefs       — emit per-row briefs to stdout or --out for the auditor.
                    By default reads both `stratified_sample` and
                    `manual_confirmed` rows; filter via `--status`.
-    add-columns  — merge a hand-edited audit-decisions sidecar TSV into
-                   the CSV (defaults to `data/audit/issue194_decisions.tsv`,
-                   which IS committed so the audit is reproducible from
-                   inputs). Sets `audit_status` to `manual_confirmed` for
-                   audited rows; idempotent on re-runs. Validates
-                   audit_decision / berkeley_label / failure_stage
-                   against the canonical vocab AND
-                   audit_decision_source against `<handle>:<YYYY-MM-DD>`.
-                   Fails loudly on unmatched keys or zero updates.
+    add-columns  — merge a hand-audited, auto-label-bound sidecar TSV into
+                   the CSV (defaults to
+                   `data/audit/issue194_decisions_labelbound.tsv`). Sets
+                   `audit_status` to `manual_confirmed` for audited rows;
+                   idempotent on re-runs. Validates each reviewed label
+                   against the current auto label and validates audit
+                   vocabularies and decision-source provenance. Fails
+                   loudly on missing/mismatched bindings, unmatched keys,
+                   or zero updates.
     render       — write the Markdown audit summary by reading the
                    augmented CSV plus
                    `data/audit/issue194_recurring_patterns.json` (also
@@ -58,7 +58,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TAXONOMY_CSV = REPO_ROOT / "results" / "metrics" / "failure_taxonomy_current.csv"
 JUDGE_LOGS_ROOT = REPO_ROOT / "results" / "judge_logs"
-DECISIONS_TSV = REPO_ROOT / "data" / "audit" / "issue194_decisions.tsv"
+DECISIONS_TSV = REPO_ROOT / "data" / "audit" / "issue194_decisions_labelbound.tsv"
 PATTERNS_JSON = REPO_ROOT / "data" / "audit" / "issue194_recurring_patterns.json"
 
 
@@ -291,10 +291,12 @@ def cmd_add_columns(args: argparse.Namespace) -> int:
     Sidecar shape (TSV):
         run_name<TAB>scenario_id<TAB>trial_index<TAB>audit_decision
         <TAB>berkeley_label<TAB>failure_stage<TAB>audit_note
-        <TAB>audit_decision_source
+        <TAB>audit_decision_source<TAB>reviewed_auto_taxonomy_label
 
-    Default sidecar path is `data/audit/issue194_decisions.tsv` (committed
-    so the audit is reproducible from inputs); override with --decisions.
+    Default sidecar path is
+    `data/audit/issue194_decisions_labelbound.tsv`. The historical unbound
+    sidecar is preserved, but explicitly passing it is refused. An audit
+    decision applies only to the auto label present when it was reviewed.
 
     Eligible rows: `audit_status` is `stratified_sample` (initial pass)
     or `manual_confirmed` (re-merge from the same sidecar after the
@@ -303,9 +305,9 @@ def cmd_add_columns(args: argparse.Namespace) -> int:
     `manual_confirmed` (idempotent on re-runs). The other 1,920+ rows
     are left alone.
 
-    Fails if the sidecar references a key that doesn't match any
-    eligible row, or if zero rows would be updated — silent no-op
-    re-runs were a v1 review-finding hazard.
+    Fails if any decision lacks a reviewed auto-label binding, if that
+    binding differs from the current label, if the sidecar references a key
+    that doesn't match any eligible row, or if zero rows would be updated.
     """
     fields, rows = _load_taxonomy_rows()
     if any(c not in fields for c in AUDIT_COLUMNS):
@@ -323,8 +325,25 @@ def cmd_add_columns(args: argparse.Namespace) -> int:
     decisions: dict[tuple[str, str, int], dict[str, str]] = {}
     with sidecar.open(encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f, delimiter="\t")
+        headers = reader.fieldnames or []
+        if len(headers) != len(set(headers)):
+            raise ValueError(
+                f"sidecar at {sidecar} has duplicate column names; "
+                "each TSV header must appear only once"
+            )
+        if "reviewed_auto_taxonomy_label" not in headers:
+            raise ValueError(
+                f"sidecar at {sidecar} is not label-bound; it must include "
+                "reviewed_auto_taxonomy_label. Re-review decisions against "
+                "the current auto labels."
+            )
         for row in reader:
             key = (row["run_name"], row["scenario_id"], int(row["trial_index"]))
+            if key in decisions:
+                raise ValueError(
+                    f"duplicate decision key {key} in sidecar at {sidecar}; "
+                    "each key must appear only once"
+                )
             decisions[key] = row
 
     eligible_statuses = {"stratified_sample", "manual_confirmed"}
@@ -337,6 +356,18 @@ def cmd_add_columns(args: argparse.Namespace) -> int:
         d = decisions.get(key)
         if not d:
             continue
+        reviewed_label = d.get("reviewed_auto_taxonomy_label", "").strip()
+        if not reviewed_label:
+            raise ValueError(
+                f"missing reviewed_auto_taxonomy_label for {key}; "
+                "re-review this decision against the current auto label"
+            )
+        if reviewed_label != r["auto_taxonomy_label"]:
+            raise ValueError(
+                f"reviewed auto taxonomy label {reviewed_label!r} does not "
+                f"match current label {r['auto_taxonomy_label']!r} for {key}; "
+                "re-review this decision before applying it"
+            )
         if d["audit_decision"] not in AUDIT_DECISIONS:
             raise ValueError(
                 f"invalid audit_decision {d['audit_decision']!r} for {key}; "
@@ -651,7 +682,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=(
             "path to the audit-decisions TSV; defaults to "
-            "data/audit/issue194_decisions.tsv (committed)"
+            "data/audit/issue194_decisions_labelbound.tsv (committed)"
         ),
     )
     pa.set_defaults(fn=cmd_add_columns)

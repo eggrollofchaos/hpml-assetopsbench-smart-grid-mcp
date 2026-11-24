@@ -10,8 +10,9 @@ PR #151 35-row table by hand; this artifact covers the full paper-grade
 flagged for completeness) without hand-auditing each one.
 
 Auto-taxonomy:
-  The six `dim_*` fields are booleans (True = the rubric dimension
-  passed). For each failure row, the auto-label is the highest-priority
+  The six `dim_*` fields are booleans. Every dimension is a positive
+  criterion except `dim_hallucinations`, where True means hallucinations
+  occurred. For each failure row, the auto-label is the highest-priority
   failed dim per CANONICAL_DIM_ORDER (`low_<dim_root>`, e.g.
   `low_task_completion`). Failure rows have between 2 and 6 failed dims —
   the full set is preserved alongside the label in `failed_dims` and
@@ -65,6 +66,11 @@ CANONICAL_DIM_ORDER = [
     "dim_clarity_and_justification",
 ]
 
+# The judge rubric records hallucinations as an occurrence signal: True is a
+# failure, unlike the other positive-scoring dimensions where False is a
+# failure.
+DIMENSIONS_FAILED_WHEN_TRUE = frozenset({"dim_hallucinations"})
+
 OUTPUT_COLUMNS = [
     "paper_eligible",
     "exclude_reason",
@@ -111,13 +117,21 @@ def load_registry(path: Path) -> dict[str, dict[str, str]]:
 def auto_taxonomy(row: dict) -> tuple[str, list[str]]:
     """Return (label, failed_dims).
 
-    `dim_*` fields are booleans where True == that rubric dimension passed.
-    Failed dims are the False ones. Label = `low_<root>` for the highest-
-    priority failed dim per CANONICAL_DIM_ORDER. `failed_dims` is the full
-    list of failed dim roots in canonical order (preserves the co-occurring
-    failure pattern that the single label drops).
+    Positive-criterion `dim_*` fields fail when False. The hallucinations
+    field is an occurrence signal and fails when True. Label = `low_<root>`
+    for the highest-priority failed dim per CANONICAL_DIM_ORDER. `failed_dims`
+    is the full list of failed dim roots in canonical order (preserves the
+    co-occurring failure pattern that the single label drops).
     """
-    failed = [d for d in CANONICAL_DIM_ORDER if row.get(d) is False]
+    failed = [
+        d
+        for d in CANONICAL_DIM_ORDER
+        if (
+            row.get(d) is True
+            if d in DIMENSIONS_FAILED_WHEN_TRUE
+            else row.get(d) is False
+        )
+    ]
     if not failed:
         return "low_unknown", []
     winner = failed[0]

@@ -26,6 +26,14 @@ import json
 import sys
 from pathlib import Path
 
+if __package__:
+    from .build_failure_taxonomy import (
+        CANONICAL_DIM_ORDER,
+        DIMENSIONS_FAILED_WHEN_TRUE,
+    )
+else:
+    from build_failure_taxonomy import CANONICAL_DIM_ORDER, DIMENSIONS_FAILED_WHEN_TRUE
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE_CSV = REPO_ROOT / "results" / "metrics" / "failure_evidence_table.csv"
 SCORES_JSONL = REPO_ROOT / "results" / "metrics" / "scenario_scores.jsonl"
@@ -40,6 +48,48 @@ BENCHMARK_ROOTS = {
 }
 
 AUDIT_COLUMNS = ["audit_status", "audit_note", "audit_decision_source"]
+DEFAULT_JUDGE_PROMPT_VERSION = "assetopsbench-6d-v1"
+
+ScoreIdentity = tuple[str, str, int, str, str]
+
+
+def _score_identity(score: dict) -> ScoreIdentity:
+    """Match the judge writer's full identity, defaulting legacy prompts."""
+    return (
+        str(score.get("run_name", "")),
+        str(score.get("scenario_id", "")),
+        int(score.get("trial_index", 0)),
+        str(score.get("judge_model", "")),
+        str(score.get("judge_prompt_version") or DEFAULT_JUDGE_PROMPT_VERSION),
+    )
+
+
+def _failed_dimensions(score: dict) -> list[str]:
+    """Require six boolean dimensions and return failures in canonical order."""
+    missing = [dimension for dimension in CANONICAL_DIM_ORDER if dimension not in score]
+    non_boolean = [
+        dimension
+        for dimension in CANONICAL_DIM_ORDER
+        if dimension in score and not isinstance(score[dimension], bool)
+    ]
+    if missing or non_boolean:
+        problems = []
+        if missing:
+            problems.append(f"missing dimensions: {', '.join(missing)}")
+        if non_boolean:
+            problems.append(f"non-boolean dimensions: {', '.join(non_boolean)}")
+        raise ValueError(
+            "invalid judge rubric dimensions (" + "; ".join(problems) + ")"
+        )
+    return [
+        dimension.removeprefix("dim_")
+        for dimension in CANONICAL_DIM_ORDER
+        if (
+            score[dimension] is True
+            if dimension in DIMENSIONS_FAILED_WHEN_TRUE
+            else score[dimension] is False
+        )
+    ]
 
 
 def _load_evidence_rows() -> list[dict]:
@@ -47,14 +97,24 @@ def _load_evidence_rows() -> list[dict]:
         return list(csv.DictReader(f))
 
 
-def _load_scores_index() -> dict[tuple[str, str, int], dict]:
-    idx: dict[tuple[str, str, int], dict] = {}
+def _load_scores_index() -> dict[ScoreIdentity, dict]:
+    idx: dict[ScoreIdentity, dict] = {}
     with SCORES_JSONL.open(encoding="utf-8") as f:
         for line in f:
             d = json.loads(line)
-            key = (d["run_name"], d["scenario_id"], int(d["trial_index"]))
+            if not isinstance(d, dict):
+                raise ValueError("judge score record must be a JSON object")
+            _failed_dimensions(d)
+            key = _score_identity(d)
             idx[key] = d
     return idx
+
+
+def _scores_for_trial(
+    scores: dict[ScoreIdentity, dict], key: tuple[str, str, int]
+) -> list[dict]:
+    """Return each distinct judge variant for a trial in source order."""
+    return [score for identity, score in scores.items() if identity[:3] == key]
 
 
 CLUSTER_PATH_PREFIX = (
@@ -259,10 +319,11 @@ def _format_brief(row: dict, score: dict | None, traj_path: Path | None) -> str:
     out.append(f"  CSV mitigation     = {row['candidate_mitigation']!r}")
     out.append(f"  CSV evidence_note  = {row['evidence_note']}")
     if score is not None:
-        failed = sorted(
-            k.replace("dim_", "")
-            for k, v in score.items()
-            if k.startswith("dim_") and v is False
+        failed = _failed_dimensions(score)
+        identity = _score_identity(score)
+        out.append(
+            "  JSONL judge identity: "
+            f"judge_model={identity[3]!r}; judge_prompt_version={identity[4]!r}"
         )
         out.append(
             f"  JSONL score_6d={score.get('score_6d')}; failed_dims={'+'.join(failed) or '(none)'}"
@@ -282,14 +343,19 @@ def cmd_briefs(args: argparse.Namespace) -> int:
     out_lines.append("")
     for row in rows:
         key = (row["run_name"], row["scenario_id"], int(row["trial_index"]))
-        score = scores.get(key)
-        traj = _resolve_trajectory_path(score)
-        out_lines.append(_format_brief(row, score, traj))
-        out_lines.append("")
+        matches = _scores_for_trial(scores, key)
+        if not matches:
+            out_lines.append(_format_brief(row, None, None))
+            out_lines.append("")
+            continue
+        for score in matches:
+            traj = _resolve_trajectory_path(score)
+            out_lines.append(_format_brief(row, score, traj))
+            out_lines.append("")
     text = "\n".join(out_lines)
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")
-        print(f"Wrote {args.out} ({len(rows)} briefs)")
+        print(f"Wrote {args.out} (evidence rows: {len(rows)})")
     else:
         print(text)
     return 0
@@ -315,6 +381,34 @@ def cmd_add_columns(args: argparse.Namespace) -> int:
             w.writerow(row)
     print(f"Added columns: {added or '(none — already present)'}")
     return 0
+
+
+def _existing_frontmatter(path: Path) -> bytes:
+    """Read and preserve complete leading YAML frontmatter before overwrite."""
+    if path.is_symlink():
+        raise ValueError(f"refusing symlink report destination: {path}")
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        if path.parent.is_dir() and not path.is_symlink():
+            return b""
+        raise
+
+    text = raw.decode("utf-8")
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return b""
+    opening_line = lines[0]
+    if raw.startswith(b"\xef\xbb\xbf"):
+        opening_line = opening_line[1:]
+    if opening_line.rstrip("\r\n") != "---":
+        return b""
+    if opening_line not in ("---\n", "---\r\n"):
+        raise ValueError(f"refusing unterminated YAML frontmatter: {path}")
+    for index in range(1, len(lines)):
+        if lines[index].rstrip("\r\n") == "---":
+            return "".join(lines[: index + 1]).encode("utf-8")
+    raise ValueError(f"refusing unterminated YAML frontmatter: {path}")
 
 
 def cmd_render(args: argparse.Namespace) -> int:
@@ -377,11 +471,11 @@ def cmd_render(args: argparse.Namespace) -> int:
     out.append("")
     out.append("| Status | Count | Share |")
     out.append("|--------|------:|------:|")
-    out.append(f"| confirmed | {confirmed} | {confirmed/n:.0%} |")
-    out.append(f"| relabel_suggested | {relabel} | {relabel/n:.0%} |")
-    out.append(f"| evidence_thin | {thin} | {thin/n:.0%} |")
+    out.append(f"| confirmed | {confirmed} | {confirmed / n:.0%} |")
+    out.append(f"| relabel_suggested | {relabel} | {relabel / n:.0%} |")
+    out.append(f"| evidence_thin | {thin} | {thin / n:.0%} |")
     if unfilled:
-        out.append(f"| (unfilled) | {unfilled} | {unfilled/n:.0%} |")
+        out.append(f"| (unfilled) | {unfilled} | {unfilled / n:.0%} |")
     out.append(f"| **total** | **{n}** | 100% |")
     out.append("")
     out.append("## Per-taxonomy confirmation rate")
@@ -427,7 +521,12 @@ def cmd_render(args: argparse.Namespace) -> int:
         "regenerated via `python scripts/audit_failure_evidence.py render`."
     )
     out.append("")
-    Path(args.out).write_text("\n".join(out), encoding="utf-8")
+    destination = Path(args.out)
+    frontmatter = _existing_frontmatter(destination)
+    report = "\n".join(out).encode("utf-8")
+    if frontmatter:
+        report = frontmatter + b"\n" + report
+    destination.write_bytes(report)
     print(f"Wrote {args.out}")
     return 0
 
