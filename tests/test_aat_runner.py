@@ -13,7 +13,6 @@ import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 
@@ -26,6 +25,7 @@ def _stub_args(**overrides):
         mcp_mode="direct",
         max_turns=30,
         parallel_tool_calls=False,
+        tool_choice=None,
         verbose=False,
     )
     defaults.update(overrides)
@@ -145,6 +145,7 @@ def test_serialize_run_result_happy_path():
     assert out["runner_meta"]["mcp_mode"] == "direct"
     assert out["runner_meta"]["max_turns"] == 30
     assert out["runner_meta"]["parallel_tool_calls"] is False
+    assert out["runner_meta"]["tool_choice"] is None
     assert out["runner_meta"]["duration_seconds"] == 12.5
     assert "aob_prompt_sha" in out["runner_meta"]
 
@@ -387,6 +388,47 @@ def test_cli_parses_required_args():
     assert args.mcp_mode == "direct"
     assert args.max_turns == 30  # default
     assert args.parallel_tool_calls is False  # vLLM-compatible default
+    assert args.tool_choice is None  # preserve provider default unless requested
+
+
+def test_cli_parses_tool_choice_modes(monkeypatch):
+    from scripts.aat_runner import build_parser
+
+    parser = build_parser()
+    common = [
+        "--prompt",
+        "p",
+        "--output",
+        "/tmp/o.json",
+        "--model-id",
+        "openai/Llama-3.1-8B-Instruct",
+        "--mcp-mode",
+        "direct",
+        "--tool-choice",
+    ]
+
+    assert parser.parse_args(common + ["auto"]).tool_choice == "auto"
+    assert parser.parse_args(common + ["required"]).tool_choice == "required"
+    assert parser.parse_args(common + ["none"]).tool_choice == "none"
+
+    monkeypatch.setenv("AAT_TOOL_CHOICE", "required")
+    assert (
+        build_parser()
+        .parse_args(
+            [
+                "--prompt",
+                "p",
+                "--output",
+                "/tmp/o.json",
+                "--model-id",
+                "openai/Llama-3.1-8B-Instruct",
+                "--mcp-mode",
+                "direct",
+            ]
+        )
+        .tool_choice
+        == "required"
+    )
 
 
 def test_cli_parses_parallel_tool_call_modes():
@@ -493,6 +535,56 @@ def test_runner_threads_litellm_env(monkeypatch):
     assert captured["max_turns"] == 30
     settings = captured["agent_kwargs"]["model_settings"]
     assert settings.kwargs["parallel_tool_calls"] is False
+
+
+def test_runner_threads_explicit_tool_choice(monkeypatch):
+    from scripts.aat_runner import AaTRunner
+
+    captured: dict[str, object] = {}
+
+    class FakeModelSettings:
+        def __init__(self, **kwargs):
+            captured["settings"] = kwargs
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["agent_kwargs"] = kwargs
+
+    class FakeRunner:
+        @staticmethod
+        async def run(agent, prompt, max_turns):
+            return _stub_run_result()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "agents",
+        SimpleNamespace(
+            Agent=FakeAgent,
+            ModelSettings=FakeModelSettings,
+            Runner=FakeRunner,
+            __version__="test",
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "agents.extensions", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "agents.extensions.models", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "agents.extensions.models.litellm_model",
+        SimpleNamespace(LitellmModel=lambda **_kwargs: object()),
+    )
+
+    runner = AaTRunner(
+        model_id="openai/Llama-3.1-8B-Instruct",
+        mcp_mode="direct",
+        parallel_tool_calls=False,
+        tool_choice="required",
+    )
+    asyncio.run(runner.run("hello"))
+
+    assert captured["settings"] == {
+        "parallel_tool_calls": False,
+        "tool_choice": "required",
+    }
 
 
 def test_watsonx_runner_omits_openai_only_model_settings(monkeypatch):
@@ -638,9 +730,7 @@ def test_batch_mode_rejects_zero_trials(tmp_path):
         )
         rc = asyncio.run(_main_multi(args, repo_root))
         assert rc == 2, f"expected rc=2 for trials={bad_trials}, got {rc}"
-        assert (
-            not new_subdir.exists()
-        ), f"output dir must not be created for trials={bad_trials}"
+        assert not new_subdir.exists()
 
 
 def test_batch_output_dir_normalization():
@@ -699,3 +789,594 @@ def test_batch_latency_path_outside_repo_root(tmp_path):
         result = out_path.as_posix()
     # tmp_path is outside repo_root, so the fallback must kick in.
     assert result == out_path.as_posix()
+
+
+# ---------------------------------------------------------------------------
+# Tool outputs are paired to their call by SDK call_id, not by position.
+#
+# The previous implementation attached each output to the LAST pending call
+# without one. Outputs arrive in call order, so on any multi-call turn that
+# reversed the pairing and every recorded trajectory mis-attributed its tool
+# results. A single-call turn hid it, which is why it survived.
+# ---------------------------------------------------------------------------
+
+
+def _tool_output_item_dict(output: str, call_id: str):
+    """Output item shaped like the pinned SDK: raw_item is a plain dict.
+
+    ``ToolCallOutputItem.raw_item`` is typed ``FunctionCallOutput``, a
+    ``TypedDict``, so at runtime it is an ordinary dict carrying ``call_id``.
+    """
+    return SimpleNamespace(
+        type="tool_call_output_item",
+        output=output,
+        raw_item={"call_id": call_id, "output": output, "type": "function_call_output"},
+    )
+
+
+def _tool_output_item_obj(output: str, call_id: str):
+    """Output item whose raw_item exposes call_id as an attribute."""
+    return SimpleNamespace(
+        type="tool_call_output_item",
+        output=output,
+        raw_item=SimpleNamespace(call_id=call_id, output=output),
+    )
+
+
+def _pairs(out):
+    """Flatten history into [(tool name, output), ...] in emission order."""
+    return [
+        (call["name"], call.get("output"))
+        for turn in out["history"]
+        for call in turn["tool_calls"]
+    ]
+
+
+@pytest.mark.parametrize("shape", [_tool_output_item_dict, _tool_output_item_obj])
+def test_tool_outputs_pair_by_call_id_not_position(shape):
+    """Two calls in one turn keep their own outputs (both raw_item shapes)."""
+    from scripts.aat_runner import _serialize_run_result
+
+    result = _stub_run_result(
+        items=[
+            _tool_call_item("forecast_rul", {"transformer_id": "T-016"}, "call_a"),
+            _tool_call_item("get_rul", {"transformer_id": "T-016"}, "call_b"),
+            shape("forecast-output", "call_a"),
+            shape("get-rul-output", "call_b"),
+            _msg_item("done"),
+        ]
+    )
+
+    out = _serialize_run_result(_stub_args(), "p", result, duration_seconds=1.0)
+
+    assert _pairs(out) == [
+        ("forecast_rul", "forecast-output"),
+        ("get_rul", "get-rul-output"),
+    ]
+
+
+def test_tool_outputs_pair_correctly_when_arrival_order_is_reversed():
+    """Arbitrary arrival order still pairs by id, not by sequence."""
+    from scripts.aat_runner import _serialize_run_result
+
+    result = _stub_run_result(
+        items=[
+            _tool_call_item("first_tool", {}, "call_a"),
+            _tool_call_item("second_tool", {}, "call_b"),
+            _tool_output_item_dict("second-output", "call_b"),
+            _tool_output_item_dict("first-output", "call_a"),
+            _msg_item("done"),
+        ]
+    )
+
+    out = _serialize_run_result(_stub_args(), "p", result, duration_seconds=1.0)
+
+    assert _pairs(out) == [
+        ("first_tool", "first-output"),
+        ("second_tool", "second-output"),
+    ]
+
+
+def test_tool_outputs_pair_across_more_than_two_calls():
+    """Five calls, shuffled outputs — the >2 case the reverse scan scrambled."""
+    from scripts.aat_runner import _serialize_run_result
+
+    names = ["t0", "t1", "t2", "t3", "t4"]
+    items = [_tool_call_item(n, {}, f"c{i}") for i, n in enumerate(names)]
+    for i in (3, 0, 4, 1, 2):
+        items.append(_tool_output_item_dict(f"out{i}", f"c{i}"))
+    items.append(_msg_item("done"))
+
+    out = _serialize_run_result(
+        _stub_args(), "p", _stub_run_result(items=items), duration_seconds=1.0
+    )
+
+    assert _pairs(out) == [(n, f"out{i}") for i, n in enumerate(names)]
+
+
+def test_tool_output_with_unknown_call_id_is_dropped_not_reassigned(caplog):
+    """An unknown id must never land on somebody else's call."""
+    from scripts.aat_runner import _serialize_run_result
+
+    result = _stub_run_result(
+        items=[
+            _tool_call_item("real_tool", {}, "call_a"),
+            _tool_output_item_dict("stray-output", "call_ghost"),
+            _msg_item("done"),
+        ]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="aat_runner"):
+        out = _serialize_run_result(_stub_args(), "p", result, duration_seconds=1.0)
+
+    assert _pairs(out) == [("real_tool", None)]
+    assert "unknown call_id" in caplog.text
+
+
+def test_duplicate_call_id_output_does_not_clobber_the_first(caplog):
+    """A second output for one id is reported, and the first is kept."""
+    from scripts.aat_runner import _serialize_run_result
+
+    result = _stub_run_result(
+        items=[
+            _tool_call_item("real_tool", {}, "call_a"),
+            _tool_output_item_dict("first-output", "call_a"),
+            _tool_output_item_dict("second-output", "call_a"),
+            _msg_item("done"),
+        ]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="aat_runner"):
+        out = _serialize_run_result(_stub_args(), "p", result, duration_seconds=1.0)
+
+    assert _pairs(out) == [("real_tool", "first-output")]
+    assert "duplicate" in caplog.text
+
+
+def test_reused_call_id_across_turns_pairs_to_later_call():
+    """A provider-reused id must not discard the later turn's result."""
+    from scripts.aat_runner import _serialize_run_result
+
+    result = _stub_run_result(
+        items=[
+            _tool_call_item("first_tool", {}, "reused-id"),
+            _tool_output_item_dict("first-output", "reused-id"),
+            _msg_item("next turn"),
+            _tool_call_item("second_tool", {}, "reused-id"),
+            _tool_output_item_dict("second-output", "reused-id"),
+            _msg_item("done"),
+        ]
+    )
+
+    out = _serialize_run_result(_stub_args(), "p", result, duration_seconds=1.0)
+
+    assert _pairs(out) == [
+        ("first_tool", "first-output"),
+        ("second_tool", "second-output"),
+    ]
+
+
+def test_legacy_single_call_output_without_call_id_still_attaches():
+    """The pre-existing id-less one-call shape keeps working."""
+    from scripts.aat_runner import _serialize_run_result
+
+    result = _stub_run_result(
+        items=[
+            _tool_call_item("only_tool", {"a": 1}, "c1"),
+            _tool_output_item("legacy-output"),
+            _msg_item("done"),
+        ]
+    )
+
+    out = _serialize_run_result(_stub_args(), "p", result, duration_seconds=1.0)
+
+    assert _pairs(out) == [("only_tool", "legacy-output")]
+
+
+def test_ambiguous_id_less_output_is_reported_not_guessed(caplog):
+    """With two unfilled calls and no id, refuse to guess."""
+    from scripts.aat_runner import _serialize_run_result
+
+    result = _stub_run_result(
+        items=[
+            _tool_call_item("tool_a", {}, "call_a"),
+            _tool_call_item("tool_b", {}, "call_b"),
+            _tool_output_item("ambiguous"),
+            _msg_item("done"),
+        ]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="aat_runner"):
+        out = _serialize_run_result(_stub_args(), "p", result, duration_seconds=1.0)
+
+    assert _pairs(out) == [("tool_a", None), ("tool_b", None)]
+    assert "ambiguous" in caplog.text
+
+
+def test_tool_output_arriving_after_turn_boundary_still_reaches_its_call():
+    """A late output finds its call even once the turn has been emitted."""
+    from scripts.aat_runner import _serialize_run_result
+
+    result = _stub_run_result(
+        items=[
+            _tool_call_item("slow_tool", {}, "call_a"),
+            _msg_item("turn one text"),
+            _tool_output_item_dict("late-output", "call_a"),
+            _msg_item("turn two text"),
+        ]
+    )
+
+    out = _serialize_run_result(_stub_args(), "p", result, duration_seconds=1.0)
+
+    assert ("slow_tool", "late-output") in _pairs(out)
+
+
+def test_failed_tool_error_is_attributed_to_the_matched_call():
+    """failed_tools names the call the error belongs to, not the newest one."""
+    from scripts.aat_runner import _serialize_run_result
+
+    bad = _tool_output_item_dict("boom", "call_a")
+    bad.error = "tool exploded"
+    result = _stub_run_result(
+        items=[
+            _tool_call_item("failing_tool", {}, "call_a"),
+            _tool_call_item("healthy_tool", {}, "call_b"),
+            bad,
+            _tool_output_item_dict("fine", "call_b"),
+            _msg_item("done"),
+        ]
+    )
+
+    out = _serialize_run_result(_stub_args(), "p", result, duration_seconds=1.0)
+
+    assert out["failed_tools"] == [{"tool": "failing_tool", "error": "tool exploded"}]
+
+
+# ---------------------------------------------------------------------------
+# An error on an output that cannot be matched to a call must not name a tool.
+#
+# The pairing fix stopped GUESSING which call an output belonged to, but the
+# error path kept attributing via pending_tool_calls[-1], so an unknown or
+# duplicate call_id still blamed whichever call happened to be last.
+# ---------------------------------------------------------------------------
+
+
+def _error_output_item(output: str, call_id: str, error: str):
+    item = _tool_output_item_dict(output, call_id)
+    item.error = error
+    return item
+
+
+def test_unknown_call_id_error_does_not_blame_another_tool(caplog):
+    from scripts.aat_runner import _serialize_run_result
+
+    result = _stub_run_result(
+        items=[
+            _tool_call_item("healthy_tool", {}, "call_a"),
+            _error_output_item("boom", "call_ghost", "tool exploded"),
+            _msg_item("done"),
+        ]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="aat_runner"):
+        out = _serialize_run_result(_stub_args(), "p", result, duration_seconds=1.0)
+
+    assert out["failed_tools"] == [{"tool": "", "error": "tool exploded"}]
+    named = [f["tool"] for f in out["failed_tools"]]
+    assert "healthy_tool" not in named
+
+
+def test_duplicate_call_id_error_does_not_blame_another_tool():
+    """A second output for an already-filled id must not name a later call."""
+    from scripts.aat_runner import _serialize_run_result
+
+    result = _stub_run_result(
+        items=[
+            _tool_call_item("first_tool", {}, "call_a"),
+            _tool_call_item("last_tool", {}, "call_b"),
+            _tool_output_item_dict("first-output", "call_a"),
+            _error_output_item("again", "call_a", "late failure"),
+            _msg_item("done"),
+        ]
+    )
+
+    out = _serialize_run_result(_stub_args(), "p", result, duration_seconds=1.0)
+
+    named = [f["tool"] for f in out["failed_tools"]]
+    assert "last_tool" not in named, "duplicate-id error blamed an unrelated tool"
+    assert "first_tool" not in named, "duplicate-id error was attributed on a guess"
+    assert out["failed_tools"] == [{"tool": "", "error": "late failure"}]
+
+
+def test_ambiguous_id_less_error_does_not_blame_another_tool():
+    from scripts.aat_runner import _serialize_run_result
+
+    bad = _tool_output_item("ambiguous")
+    bad.error = "who failed?"
+    result = _stub_run_result(
+        items=[
+            _tool_call_item("tool_a", {}, "call_a"),
+            _tool_call_item("tool_b", {}, "call_b"),
+            bad,
+            _msg_item("done"),
+        ]
+    )
+
+    out = _serialize_run_result(_stub_args(), "p", result, duration_seconds=1.0)
+
+    assert out["failed_tools"] == [{"tool": "", "error": "who failed?"}]
+
+
+def test_matched_error_still_names_its_own_tool():
+    """The fix must not cost correct attribution when the call IS known."""
+    from scripts.aat_runner import _serialize_run_result
+
+    result = _stub_run_result(
+        items=[
+            _tool_call_item("failing_tool", {}, "call_a"),
+            _tool_call_item("healthy_tool", {}, "call_b"),
+            _error_output_item("boom", "call_a", "tool exploded"),
+            _tool_output_item_dict("fine", "call_b"),
+            _msg_item("done"),
+        ]
+    )
+
+    out = _serialize_run_result(_stub_args(), "p", result, duration_seconds=1.0)
+
+    assert out["failed_tools"] == [{"tool": "failing_tool", "error": "tool exploded"}]
+
+
+def test_single_trial_exception_payload_is_marked_infrastructure(tmp_path, monkeypatch):
+    from scripts import aat_runner
+
+    class FakeServer:
+        async def cleanup(self):
+            return None
+
+    class FakeRunner:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def run(self, _prompt):
+            raise RuntimeError("MCP unavailable")
+
+    async def build_servers(_repo_root):
+        return [FakeServer()]
+
+    monkeypatch.setattr(aat_runner, "AaTRunner", FakeRunner)
+    monkeypatch.setitem(
+        sys.modules,
+        "scripts.aat_tools_mcp",
+        SimpleNamespace(build_mcp_servers=build_servers),
+    )
+    output = tmp_path / "trial.json"
+    args = _stub_args(
+        output=str(output),
+        mcp_mode="optimized",
+        scenarios_glob=None,
+        output_dir=None,
+    )
+
+    assert asyncio.run(aat_runner._main(args)) == 1
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["state"] == "infrastructure_error"
+    assert payload["infrastructure_error"] is True
+    assert payload["success"] is False
+    assert payload["runner_meta"]["tool_choice"] is None
+
+
+def test_single_trial_model_exception_is_terminal_failure(tmp_path, monkeypatch):
+    from agents.exceptions import MaxTurnsExceeded
+    from scripts import aat_runner
+
+    class FakeRunner:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def run(self, _prompt):
+            raise MaxTurnsExceeded("turn budget reached")
+
+    monkeypatch.setattr(aat_runner, "AaTRunner", FakeRunner)
+    output = tmp_path / "trial.json"
+    args = _stub_args(
+        output=str(output),
+        mcp_mode="direct",
+        scenarios_glob=None,
+        output_dir=None,
+    )
+
+    assert asyncio.run(aat_runner._main(args)) == 1
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["state"] == "complete_failure"
+    assert payload["model_error"] is True
+    assert payload["max_turns_exhausted"] is True
+    assert "infrastructure_error" not in payload
+
+
+def test_batch_exception_payload_updates_infrastructure_stats(tmp_path, monkeypatch):
+    from scripts import aat_runner
+
+    class FakeServer:
+        async def cleanup(self):
+            return None
+
+    class FakeRunner:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def run(self, _prompt):
+            raise RuntimeError("MCP unavailable")
+
+    async def build_servers(_repo_root):
+        return [FakeServer()]
+
+    monkeypatch.setattr(aat_runner, "AaTRunner", FakeRunner)
+    monkeypatch.setitem(
+        sys.modules,
+        "scripts.aat_tools_mcp",
+        SimpleNamespace(build_mcp_servers=build_servers),
+    )
+    scenarios = tmp_path / "scenarios"
+    scenarios.mkdir()
+    (scenarios / "one.json").write_text(
+        json.dumps({"id": "SGT-001", "text": "test prompt"}) + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "raw"
+    args = _stub_args(
+        scenarios_glob="scenarios/*.json",
+        output_dir=str(output_dir),
+        prompt=None,
+        output=None,
+        mcp_mode="optimized",
+        trials=1,
+        run_basename="run",
+    )
+
+    assert asyncio.run(aat_runner._main_multi(args, tmp_path)) == 1
+    stats = json.loads((output_dir / "_batch_stats.json").read_text(encoding="utf-8"))
+    assert stats["infrastructure_errors"] == 1
+    assert stats["terminal_records"] == 1
+    payload = json.loads(
+        (output_dir / "run_one_run01.json").read_text(encoding="utf-8")
+    )
+    assert payload["state"] == "infrastructure_error"
+    assert payload["runner_meta"]["parallel_tool_calls"] is False
+
+
+@pytest.mark.parametrize("mcp_mode", ["direct", "baseline", "optimized"])
+@pytest.mark.parametrize("http_retries, expected_attempts", [("0", 1), (None, 3)])
+def test_http_retry_opt_in_reaches_transport(
+    monkeypatch, mcp_mode, http_retries, expected_attempts
+):
+    import socket
+
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    import httpx
+    import litellm
+    from agents import function_tool
+    from agents.tracing import get_trace_provider
+    from litellm.llms.openai.openai import OpenAIChatCompletion
+
+    from scripts import aat_runner
+    from scripts.aat_system_prompt import AOB_SYSTEM_PROMPT
+
+    monkeypatch.setattr(litellm, "telemetry", False)
+    monkeypatch.setattr(get_trace_provider(), "_disabled", True)
+    if http_retries is None:
+        monkeypatch.delenv("AAT_HTTP_RETRIES", raising=False)
+    else:
+        monkeypatch.setenv("AAT_HTTP_RETRIES", http_retries)
+        monkeypatch.setattr(litellm, "num_retries", 2)
+    requests = []
+
+    def deny_socket(*_args, **_kwargs):
+        raise AssertionError("unexpected outbound socket attempt")
+
+    monkeypatch.setattr(socket.socket, "connect", deny_socket)
+    monkeypatch.setattr(socket.socket, "connect_ex", deny_socket)
+    monkeypatch.setattr(socket.socket, "sendto", deny_socket)
+    monkeypatch.setattr(socket, "create_connection", deny_socket)
+
+    @function_tool
+    def offline_tool() -> str:
+        """Unused tool for checking the serialized tool-call settings."""
+        raise AssertionError("HTTP failure must not execute tools")
+
+    def fail(request):
+        assert request.url.host == "offline.invalid"
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            500,
+            json={"error": {"message": "offline HTTP failure", "type": "server_error"}},
+        )
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(fail)) as client:
+            monkeypatch.setattr(
+                OpenAIChatCompletion,
+                "_get_async_http_client",
+                staticmethod(lambda **_kwargs: client),
+            )
+            runner = aat_runner.AaTRunner(
+                model_id="openai/Llama-3.1-8B-Instruct",
+                mcp_mode=mcp_mode,
+                litellm_base_url=f"https://offline.invalid/{mcp_mode}/{http_retries}/v1",
+                litellm_api_key="offline-not-a-secret",
+                tools=[offline_tool],
+            )
+            with pytest.raises(
+                litellm.InternalServerError, match="offline HTTP failure"
+            ) as error:
+                await runner.run("hello")
+            payload = aat_runner._exception_output_payload(
+                _stub_args(mcp_mode=mcp_mode), "hello", error.value, 0.0
+            )
+            assert payload["infrastructure_error"] is True
+
+    asyncio.run(exercise())
+    assert len(requests) == expected_attempts
+    assert requests[0]["messages"] == [
+        {"role": "system", "content": AOB_SYSTEM_PROMPT},
+        {"role": "user", "content": "hello"},
+    ]
+    assert requests[0]["parallel_tool_calls"] is False
+    assert "temperature" not in requests[0]
+    assert "max_tokens" not in requests[0]
+    assert "tool_choice" not in requests[0]
+
+
+@pytest.mark.parametrize("value", ["1", "-1", "false", "invalid"])
+def test_http_retry_opt_in_rejects_invalid_values(monkeypatch, value):
+    from scripts.aat_runner import AaTRunner
+
+    monkeypatch.setenv("AAT_HTTP_RETRIES", value)
+    with pytest.raises(ValueError, match="AAT_HTTP_RETRIES must be 0 or unset"):
+        asyncio.run(AaTRunner(model_id="openai/test", mcp_mode="direct").run("hello"))
+
+
+def test_http_retry_opt_in_adds_settings_when_parallel_calls_are_auto(monkeypatch):
+    from scripts.aat_runner import AaTRunner
+
+    captured: dict[str, object] = {}
+
+    class FakeModelSettings:
+        def __init__(self, **kwargs):
+            captured["settings"] = kwargs
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["agent_kwargs"] = kwargs
+
+    class FakeRunner:
+        @staticmethod
+        async def run(_agent, _prompt, max_turns):
+            return _stub_run_result()
+
+    monkeypatch.setenv("AAT_HTTP_RETRIES", "0")
+    monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(drop_params=False))
+    monkeypatch.setitem(
+        sys.modules,
+        "agents",
+        SimpleNamespace(
+            Agent=FakeAgent,
+            ModelSettings=FakeModelSettings,
+            Runner=FakeRunner,
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "agents.extensions", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "agents.extensions.models", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "agents.extensions.models.litellm_model",
+        SimpleNamespace(LitellmModel=lambda **_kwargs: object()),
+    )
+
+    runner = AaTRunner(
+        model_id="openai/Llama-3.1-8B-Instruct",
+        mcp_mode="direct",
+        parallel_tool_calls=None,
+    )
+    asyncio.run(runner.run("hello"))
+
+    assert captured["settings"] == {"extra_args": {"max_retries": 0, "num_retries": 0}}

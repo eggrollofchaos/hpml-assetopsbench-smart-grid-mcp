@@ -22,7 +22,9 @@ Data source: data/processed/rul_labels.csv, sensor_readings.csv
 
 from __future__ import annotations
 
+import math
 import sys
+from datetime import date, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -30,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import numpy as np
 import pandas as pd
 from mcp.server.fastmcp import FastMCP
+from pydantic import StrictFloat, StrictInt, StrictStr
 
 from data.constants import HI_FULL_HEALTH_DAYS
 from mcp_servers.base import load_rul_labels, load_sensor_readings
@@ -38,6 +41,69 @@ mcp = FastMCP("smart-grid-tsfm")
 
 _rul: pd.DataFrame | None = None
 _readings: pd.DataFrame | None = None
+
+
+def _validate_anomaly_parameters(window_size: int, z_threshold: float) -> dict | None:
+    if (
+        isinstance(window_size, bool)
+        or not isinstance(window_size, (int, np.integer))
+        or window_size <= 0
+        or window_size > sys.maxsize
+    ):
+        return {"error": "window_size must be a positive integer."}
+    if isinstance(z_threshold, bool) or not isinstance(
+        z_threshold, (int, float, np.integer, np.floating)
+    ):
+        return {"error": "z_threshold must be a finite positive number."}
+    try:
+        threshold = float(z_threshold)
+    except OverflowError:
+        return {"error": "z_threshold must be a finite positive number."}
+    if not math.isfinite(threshold) or threshold <= 0:
+        return {"error": "z_threshold must be a finite positive number."}
+    return None
+
+
+def _parse_time_bound(value: str, name: str) -> tuple[pd.Timestamp | None, dict | None]:
+    if not isinstance(value, str):
+        return None, {"error": f"{name} must be a valid ISO-8601 datetime."}
+    try:
+        if len(value) == 10:
+            parsed = pd.Timestamp(date.fromisoformat(value))
+        elif len(value) > 10 and value[10] in "Tt ":
+            datetime.fromisoformat(
+                value[:-1] + "+00:00" if value.endswith("Z") else value
+            )
+            time_value = value[11:]
+            offset_positions = [
+                position
+                for marker in ("+", "-")
+                if (position := time_value.find(marker)) >= 0
+            ]
+            clock_value = (
+                time_value[: min(offset_positions)] if offset_positions else time_value
+            )
+            if clock_value.endswith("Z"):
+                clock_value = clock_value[:-1]
+            decimal_positions = [
+                position
+                for marker in (".", ",")
+                if (position := clock_value.find(marker)) >= 0
+            ]
+            if decimal_positions and len(clock_value) - min(decimal_positions) - 1 > 9:
+                raise ValueError
+            timestamp_value = value[:10] + "T" + value[11:]
+            if timestamp_value.endswith("Z"):
+                timestamp_value = timestamp_value[:-1] + "+00:00"
+            timestamp_value = timestamp_value.replace(",", ".", 1)
+            parsed = pd.Timestamp(timestamp_value)
+        else:
+            raise ValueError
+    except (OverflowError, TypeError, ValueError):
+        return None, {"error": f"{name} must be a valid ISO-8601 datetime."}
+    if parsed.tzinfo is not None:
+        parsed = parsed.tz_convert("UTC").tz_localize(None)
+    return parsed, None
 
 
 def _confidence_from_history(num_points: int, horizon_days: int = 0) -> float:
@@ -175,8 +241,8 @@ def forecast_rul(transformer_id: str, horizon_days: int = 30) -> dict:
 def detect_anomalies(
     transformer_id: str,
     sensor_id: str,
-    window_size: int = 24,
-    z_threshold: float = 3.0,
+    window_size: StrictInt = 24,
+    z_threshold: StrictFloat = 3.0,
 ) -> dict:
     """
     Detect anomalous sensor readings using a rolling z-score method.
@@ -195,6 +261,12 @@ def detect_anomalies(
         anomaly_count, anomaly_rate_pct, anomalies (list of flagged readings
         with timestamp, value, z_score).
     """
+    validation_error = _validate_anomaly_parameters(window_size, z_threshold)
+    if validation_error is not None:
+        return validation_error
+    window_size = int(window_size)
+    z_threshold = float(z_threshold)
+
     df = _get_readings()
     subset = (
         df[(df["transformer_id"] == transformer_id) & (df["sensor_id"] == sensor_id)]
@@ -241,8 +313,8 @@ def detect_anomalies(
 def trend_analysis(
     transformer_id: str,
     sensor_id: str,
-    start_time: str | None = None,
-    end_time: str | None = None,
+    start_time: StrictStr | None = None,
+    end_time: StrictStr | None = None,
 ) -> dict:
     """
     Compute the trend (slope) of a sensor's readings over a time window.
@@ -262,6 +334,18 @@ def trend_analysis(
         slope_per_day, direction ("increasing"/"decreasing"/"stable"),
         r_squared.
     """
+    start_bound = end_bound = None
+    if start_time is not None:
+        start_bound, error = _parse_time_bound(start_time, "start_time")
+        if error is not None:
+            return error
+    if end_time is not None:
+        end_bound, error = _parse_time_bound(end_time, "end_time")
+        if error is not None:
+            return error
+    if start_bound is not None and end_bound is not None and start_bound > end_bound:
+        return {"error": "start_time must be before or equal to end_time."}
+
     df = _get_readings()
     subset = df[
         (df["transformer_id"] == transformer_id) & (df["sensor_id"] == sensor_id)
@@ -273,21 +357,24 @@ def trend_analysis(
             f"sensor='{sensor_id}'."
         }
 
-    subset["timestamp"] = pd.to_datetime(subset["timestamp"])
-    if start_time:
-        subset = subset[subset["timestamp"] >= pd.to_datetime(start_time)]
-    if end_time:
-        subset = subset[subset["timestamp"] <= pd.to_datetime(end_time)]
+    subset["timestamp"] = subset["timestamp"].map(pd.Timestamp)
+    subset["_timestamp_utc"] = pd.to_datetime(
+        subset["timestamp"], utc=True
+    ).dt.tz_localize(None)
+    if start_bound is not None:
+        subset = subset[subset["_timestamp_utc"] >= start_bound]
+    if end_bound is not None:
+        subset = subset[subset["_timestamp_utc"] <= end_bound]
 
-    subset = subset.sort_values("timestamp")
+    subset = subset.sort_values("_timestamp_utc")
     if len(subset) < 2:
         return {
             "error": "Not enough readings in the specified window for trend analysis."
         }
 
     # Convert timestamps to numeric (days since first reading)
-    t0 = subset["timestamp"].iloc[0]
-    days = (subset["timestamp"] - t0).dt.total_seconds() / 86400
+    t0 = subset["_timestamp_utc"].iloc[0]
+    days = (subset["_timestamp_utc"] - t0).dt.total_seconds() / 86400
     vals = subset["value"].astype(float)
 
     # OLS: slope and R²

@@ -12,8 +12,6 @@ Covers:
 import sys
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mcp_servers.iot_server.server import (
@@ -112,9 +110,7 @@ def test_list_sensors_known():
 def test_list_sensors_missing_returns_error_dict():
     # Error must be a dict, not a list — harness checks result["error"]
     result = list_sensors("T-NONEXISTENT")
-    assert isinstance(
-        result, dict
-    ), "list_sensors error case must return a dict, not a list"
+    assert isinstance(result, dict)
     assert "error" in result
 
 
@@ -127,6 +123,17 @@ def _get_first_sensor(transformer_id: str) -> str:
     sensors = list_sensors(transformer_id)
     assert isinstance(sensors, list) and len(sensors) > 0
     return sensors[0]["sensor_id"]
+
+
+def test_get_sensor_readings_doc_examples_match_fixture_vocabulary():
+    """Documentation examples must name real fixture sensors."""
+    sensors = {row["sensor_id"] for row in list_sensors("T-001")}
+    doc = get_sensor_readings.__doc__ or ""
+
+    assert {"oil_temp_c", "winding_temp_top_c"} <= sensors
+    assert 'e.g. "oil_temp_c" or "winding_temp_top_c"' in doc
+    assert "dga_h2_ppm" not in doc
+    assert "winding_temp_c" not in doc
 
 
 def test_get_sensor_readings_happy_path():

@@ -20,6 +20,9 @@ Multi-scenario batch invocation (Cell C connection reuse):
     aat_runner.py --scenarios-glob GLOB --trials N --output-dir DIR
                   --run-basename NAME --model-id ID --mcp-mode optimized
 
+For a no-retry diagnostic, export AAT_HTTP_RETRIES=0 in the run config.
+Unset or empty preserves provider defaults; other values are rejected.
+
 The runner code is otherwise identical across cells — only the tool
 surface and invocation mode differ. That is the fairness contract for
 latency comparisons between cells.
@@ -52,6 +55,70 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 _LOG = logging.getLogger("aat_runner")
+
+try:
+    from agents.exceptions import MaxTurnsExceeded as _MaxTurnsExceeded
+    from agents.exceptions import ModelBehaviorError as _ModelBehaviorError
+except ImportError:  # pragma: no cover - exercised when the SDK is absent
+    _MODEL_FAILURE_EXCEPTION_TYPES: tuple[type[Exception], ...] = ()
+    _MaxTurnsExceeded = None
+    _ModelBehaviorError = None
+else:
+    _MODEL_FAILURE_EXCEPTION_TYPES = (_MaxTurnsExceeded, _ModelBehaviorError)
+
+
+def _is_model_failure_exception(exc: Exception) -> bool:
+    return isinstance(exc, _MODEL_FAILURE_EXCEPTION_TYPES)
+
+
+def _exception_output_payload(
+    args: argparse.Namespace,
+    prompt: str,
+    exc: Exception,
+    duration_seconds: float,
+    *,
+    scenario_payload: dict[str, Any] | None = None,
+    scenario_file: str | None = None,
+) -> dict[str, Any]:
+    """Serialize a runner exception with a durable terminality marker."""
+    from scripts.aat_system_prompt import AOB_PROMPT_SHA
+
+    model_failure = _is_model_failure_exception(exc)
+    max_turns_exhausted = _MaxTurnsExceeded is not None and isinstance(
+        exc, _MaxTurnsExceeded
+    )
+    payload: dict[str, Any] = {
+        "question": prompt,
+        "answer": "",
+        "success": False,
+        "state": "complete_failure" if model_failure else "infrastructure_error",
+        "error": f"{type(exc).__name__}: {exc}",
+        "failed_tools": [],
+        "max_turns_exhausted": max_turns_exhausted,
+        "turn_count": 0,
+        "tool_call_count": 0,
+        "history": [],
+        "runner_meta": {
+            "model_id": args.model_id,
+            "mcp_mode": args.mcp_mode,
+            "aob_prompt_sha": AOB_PROMPT_SHA,
+            "max_turns": args.max_turns,
+            "parallel_tool_calls": args.parallel_tool_calls,
+            "tool_choice": getattr(args, "tool_choice", None),
+            "temperature": getattr(args, "temperature", None),
+            "max_tokens": getattr(args, "max_tokens", None),
+            "sdk_version": "unknown",
+            "duration_seconds": duration_seconds,
+            "scenario_file": scenario_file,
+        },
+    }
+    if model_failure:
+        payload["model_error"] = True
+    else:
+        payload["infrastructure_error"] = True
+    if scenario_payload is not None:
+        payload["scenario"] = scenario_payload
+    return payload
 
 
 def _json_default(obj: Any) -> Any:
@@ -223,6 +290,15 @@ def build_parser() -> argparse.ArgumentParser:
             "(default: false; set AAT_PARALLEL_TOOL_CALLS=auto for SDK default)."
         ),
     )
+    p.add_argument(
+        "--tool-choice",
+        choices=("auto", "required", "none"),
+        default=os.environ.get("AAT_TOOL_CHOICE"),
+        help=(
+            "Tool-choice policy forwarded to the Agents SDK. Omit to preserve "
+            "provider default; native llama.cpp smoke may use required."
+        ),
+    )
     p.add_argument("--verbose", action="store_true")
     return p
 
@@ -244,7 +320,7 @@ def _parse_parallel_tool_calls(value: str | None) -> bool | None:
     if raw in {"auto", "default", "none"}:
         return None
     raise argparse.ArgumentTypeError(
-        "parallel tool calls must be true, false, or auto; " f"got {value!r}"
+        f"parallel tool calls must be true, false, or auto; got {value!r}"
     )
 
 
@@ -274,6 +350,29 @@ def _configure_litellm_provider_compat(model_id: str) -> None:
     litellm.drop_params = True
 
 
+def _output_call_id(item: Any) -> str | None:
+    """Return the SDK call_id a ``tool_call_output_item`` belongs to.
+
+    The pinned openai-agents (0.14.5) types ``ToolCallOutputItem.raw_item`` as a
+    union of ``FunctionCallOutput`` — a ``TypedDict``, so a plain ``dict`` at
+    runtime — and several pydantic models, plus a bare ``dict[str, Any]``. Both
+    shapes carry ``call_id``, so probe mapping access first and attribute access
+    second, then fall back to the item itself. Returns ``None`` when no id is
+    present, which is how the pre-SDK one-call fixtures look.
+    """
+    raw = getattr(item, "raw_item", None)
+    for source in (raw, item):
+        if source is None:
+            continue
+        if isinstance(source, dict):
+            value = source.get("call_id") or source.get("id")
+        else:
+            value = getattr(source, "call_id", None) or getattr(source, "id", None)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _serialize_run_result(
     args: argparse.Namespace,
     prompt: str,
@@ -297,6 +396,13 @@ def _serialize_run_result(
     turn = 0
     pending_tool_calls: list[dict[str, Any]] = []
     failed_tools: list[dict[str, str]] = []
+    # call_id -> every call dict recorded for it. Deliberately NOT cleared when
+    # a turn closes: _close_turn() shallow-copies the pending list, so the dicts
+    # stay shared with the emitted history entry and a late-arriving output can
+    # still reach its own call across a turn boundary. A provider may reuse an
+    # id on a later turn, so one candidate per id would silently drop that
+    # later result after the first occurrence is filled.
+    calls_by_id: dict[str, list[dict[str, Any]]] = {}
 
     # Flushing semantics match AOB's _build_trajectory
     # (../AssetOpsBench/src/agent/openai_agent/runner.py:121). A "turn" is
@@ -358,27 +464,95 @@ def _serialize_run_result(
                     "call_id": call_id,
                 }
             )
+            if call_id:
+                calls_by_id.setdefault(call_id, []).append(pending_tool_calls[-1])
             tool_call_count += 1
         elif item_type == "tool_call_output_item":
             output = getattr(item, "output", "")
-            # Attach to the most recent pending call that has no output yet.
-            attached = False
-            for call in reversed(pending_tool_calls):
-                if "output" not in call:
-                    call["output"] = output
-                    attached = True
-                    break
-            if not attached:
-                _LOG.warning(
-                    "dropping tool_call_output_item without a pending tool call"
-                )
+            # Pair by the SDK's own call_id. A positional scan mis-attributes
+            # every multi-call turn: outputs arrive in call order but the old
+            # reverse scan filled the LAST unfilled call first, exactly
+            # reversing the pairing.
+            output_call_id = _output_call_id(item)
+            matched: dict[str, Any] | None = None
+            if output_call_id is not None:
+                candidates = [
+                    call
+                    for call in calls_by_id.get(output_call_id, [])
+                    if "output" not in call
+                ]
+                if not candidates:
+                    # Never fall back to positional guessing — that is how an
+                    # output lands on somebody else's call.
+                    occurrences = calls_by_id.get(output_call_id, [])
+                    if not occurrences:
+                        _LOG.warning(
+                            "dropping tool_call_output_item with unknown call_id %r",
+                            output_call_id,
+                        )
+                    else:
+                        from_this_turn = any(
+                            any(call is occurrence for call in pending_tool_calls)
+                            for occurrence in occurrences
+                        )
+                        duplicate_kind = (
+                            "already filled in this turn"
+                            if from_this_turn
+                            else "call_id reused from an earlier completed turn"
+                        )
+                        _LOG.warning(
+                            "ignoring duplicate tool_call_output_item for call_id %r (%s)",
+                            output_call_id,
+                            duplicate_kind,
+                        )
+                elif len(candidates) > 1:
+                    # Multiple unfilled occurrences with one id are genuinely
+                    # ambiguous; do not guess which turn produced this output.
+                    _LOG.warning(
+                        "dropping tool_call_output_item with ambiguous repeated "
+                        "call_id %r (%d unfilled occurrences)",
+                        output_call_id,
+                        len(candidates),
+                    )
+                else:
+                    matched = candidates[0]
+            else:
+                # No id at all: the legacy one-call shape. Attach only when the
+                # current turn leaves exactly one unfilled call, so this stays
+                # unambiguous; anything else is reported, not guessed.
+                unfilled = [c for c in pending_tool_calls if "output" not in c]
+                if len(unfilled) == 1:
+                    matched = unfilled[0]
+                elif not unfilled:
+                    _LOG.warning(
+                        "dropping tool_call_output_item without a pending tool call"
+                    )
+                else:
+                    _LOG.warning(
+                        "dropping tool_call_output_item without a call_id; "
+                        "%d pending calls are unfilled so the pairing is ambiguous",
+                        len(unfilled),
+                    )
+            if matched is not None:
+                matched["output"] = output
             # Defensive: the real Agents SDK today surfaces tool errors as
             # stringified output content, not a separate .error attribute.
             # Kept as a forward-compat hook for future SDK versions that may.
             err = getattr(item, "error", None)
             if err:
-                last_name = pending_tool_calls[-1]["name"] if pending_tool_calls else ""
-                failed_tools.append({"tool": last_name, "error": str(err)})
+                if matched is not None:
+                    failed_tools.append({"tool": matched["name"], "error": str(err)})
+                else:
+                    # The output could not be tied to a call, so neither can its
+                    # error. Naming the newest pending call here — which this
+                    # code used to do — blames a tool that did not fail, the
+                    # same misattribution the pairing fix exists to prevent.
+                    # Keep the error, drop the guess.
+                    _LOG.warning(
+                        "recording tool error with no tool attribution: the "
+                        "output it arrived on could not be matched to a call"
+                    )
+                    failed_tools.append({"tool": "", "error": str(err)})
 
     # Close the final turn (text or tool calls still buffered).
     _close_turn()
@@ -440,6 +614,7 @@ def _serialize_run_result(
             "aob_prompt_sha": AOB_PROMPT_SHA,
             "max_turns": args.max_turns,
             "parallel_tool_calls": args.parallel_tool_calls,
+            "tool_choice": getattr(args, "tool_choice", None),
             "sdk_version": f"openai-agents=={sdk_version}",
             "duration_seconds": duration_seconds,
             "scenario_file": scenario_file,
@@ -467,10 +642,16 @@ class AaTRunner:
     litellm_base_url: str | None = None
     litellm_api_key: str | None = None
     parallel_tool_calls: bool | None = False
+    tool_choice: str | None = None
 
     async def run(self, prompt: str):
+        http_retries = os.environ.get("AAT_HTTP_RETRIES", "").strip()
+        if http_retries not in ("", "0"):
+            raise ValueError("AAT_HTTP_RETRIES must be 0 or unset")
+
         from agents import Agent, ModelSettings, Runner
         from agents.extensions.models.litellm_model import LitellmModel
+
         from scripts.aat_system_prompt import AOB_SYSTEM_PROMPT
 
         if _is_watsonx_model(self.model_id) and self.parallel_tool_calls is True:
@@ -496,10 +677,16 @@ class AaTRunner:
                 api_key=api_key,
             ),
         }
+        settings_kwargs: dict[str, Any] = {}
         if effective_parallel_tool_calls is not None:
-            agent_kwargs["model_settings"] = ModelSettings(
-                parallel_tool_calls=self.parallel_tool_calls,
-            )
+            settings_kwargs["parallel_tool_calls"] = self.parallel_tool_calls
+        if self.tool_choice is not None:
+            settings_kwargs["tool_choice"] = self.tool_choice
+        if http_retries == "0":
+            # LiteLLM and its provider SDK have separate automatic retry layers.
+            settings_kwargs["extra_args"] = {"max_retries": 0, "num_retries": 0}
+        if settings_kwargs:
+            agent_kwargs["model_settings"] = ModelSettings(**settings_kwargs)
         agent = Agent(**agent_kwargs)
         return await Runner.run(agent, prompt, max_turns=self.max_turns)
 
@@ -544,6 +731,7 @@ async def _main_multi(args: argparse.Namespace, repo_root: Path) -> int:
     mcp_servers: list = []
     latency_records: list[dict[str, Any]] = []
     any_failed = False
+    infrastructure_errors = 0
 
     try:
         mcp_setup_start = time.time()
@@ -557,6 +745,7 @@ async def _main_multi(args: argparse.Namespace, repo_root: Path) -> int:
             max_turns=args.max_turns,
             mcp_servers=mcp_servers,
             parallel_tool_calls=args.parallel_tool_calls,
+            tool_choice=getattr(args, "tool_choice", None),
         )
 
         for sf in scenario_files:
@@ -606,32 +795,18 @@ async def _main_multi(args: argparse.Namespace, repo_root: Path) -> int:
                     _LOG.exception(
                         "trial failed (%s trial %d): %s", sf.name, trial, exc
                     )
-                    from scripts.aat_system_prompt import AOB_PROMPT_SHA
-
-                    error_payload = {
-                        "question": prompt,
-                        "answer": "",
-                        "success": False,
-                        "error": f"{type(exc).__name__}: {exc}",
-                        "failed_tools": [],
-                        "max_turns_exhausted": False,
-                        "turn_count": 0,
-                        "tool_call_count": 0,
-                        "history": [],
-                        "scenario": scenario_payload,
-                        "runner_meta": {
-                            "model_id": args.model_id,
-                            "mcp_mode": args.mcp_mode,
-                            "aob_prompt_sha": AOB_PROMPT_SHA,
-                            "max_turns": args.max_turns,
-                            "parallel_tool_calls": args.parallel_tool_calls,
-                            "sdk_version": "unknown",
-                            "duration_seconds": time.time() - start,
-                            "scenario_file": sf_rel,
-                        },
-                    }
+                    error_payload = _exception_output_payload(
+                        args,
+                        prompt,
+                        exc,
+                        time.time() - start,
+                        scenario_payload=scenario_payload,
+                        scenario_file=sf_rel,
+                    )
                     _write_output(out_path, error_payload)
                     any_failed = True
+                    if error_payload.get("infrastructure_error") is True:
+                        infrastructure_errors += 1
 
                 # wall_clock_duration: ends after the JSON write to match
                 # single-trial path semantics (run_experiment.sh measures
@@ -673,6 +848,19 @@ async def _main_multi(args: argparse.Namespace, repo_root: Path) -> int:
     latency_path = output_dir / "_batch_latencies.jsonl"
     latency_path.write_text(
         "\n".join(json.dumps(r) for r in latency_records) + "\n",
+        encoding="utf-8",
+    )
+    (output_dir / "_batch_stats.json").write_text(
+        json.dumps(
+            {
+                "resume_skipped": 0,
+                "resume_rerun": 0,
+                "infrastructure_errors": infrastructure_errors,
+                "terminal_records": len(latency_records),
+            },
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
     _LOG.info("wrote %d latency records → %s", len(latency_records), latency_path)
@@ -721,6 +909,7 @@ async def _main(args: argparse.Namespace) -> int:
         tools=tools,
         mcp_servers=mcp_servers,
         parallel_tool_calls=args.parallel_tool_calls,
+        tool_choice=getattr(args, "tool_choice", None),
     )
 
     start = time.time()
@@ -729,29 +918,9 @@ async def _main(args: argparse.Namespace) -> int:
         result = await runner.run(args.prompt)
     except Exception as exc:
         _LOG.exception("runner failed: %s", exc)
-        from scripts.aat_system_prompt import AOB_PROMPT_SHA
-
-        error_payload = {
-            "question": args.prompt,
-            "answer": "",
-            "success": False,
-            "error": f"{type(exc).__name__}: {exc}",
-            "failed_tools": [],
-            "max_turns_exhausted": False,
-            "turn_count": 0,
-            "tool_call_count": 0,
-            "history": [],
-            "runner_meta": {
-                "model_id": args.model_id,
-                "mcp_mode": args.mcp_mode,
-                "aob_prompt_sha": AOB_PROMPT_SHA,
-                "max_turns": args.max_turns,
-                "parallel_tool_calls": args.parallel_tool_calls,
-                "sdk_version": "unknown",
-                "duration_seconds": time.time() - start,
-                "scenario_file": None,
-            },
-        }
+        error_payload = _exception_output_payload(
+            args, args.prompt, exc, time.time() - start
+        )
     finally:
         for srv in mcp_servers:
             try:

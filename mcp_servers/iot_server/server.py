@@ -144,7 +144,7 @@ def get_sensor_readings(
 
     Args:
         transformer_id: Asset identifier, e.g. "T-001".
-        sensor_id:      Sensor name, e.g. "dga_h2_ppm" or "winding_temp_c".
+        sensor_id:      Sensor name, e.g. "oil_temp_c" or "winding_temp_top_c".
                         Use list_sensors() to discover valid sensor IDs.
         start_time:     ISO-8601 datetime string (inclusive). Optional.
         end_time:       ISO-8601 datetime string (inclusive). Optional.

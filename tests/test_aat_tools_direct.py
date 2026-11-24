@@ -7,9 +7,11 @@ agents SDK function_tool, preserving the MCP-visible name and description.
 from __future__ import annotations
 
 import asyncio
+import json
 import pathlib
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 
@@ -20,9 +22,7 @@ def test_build_direct_tools_returns_one_per_registry_entry() -> None:
     tools = build_direct_tools()
     registry = direct_adapter.get_tools()
 
-    assert len(tools) == len(
-        registry
-    ), f"Expected {len(registry)} tools wrapped, got {len(tools)}"
+    assert len(tools) == len(registry)
 
 
 def test_build_direct_tools_uses_mcp_visible_names() -> None:
@@ -76,7 +76,6 @@ def test_direct_and_mcp_tool_schemas_match(monkeypatch):
 
     Marked @pytest.mark.slow because it launches 4 MCP stdio subprocesses.
     """
-    from mcp_servers import direct_adapter
     from scripts.aat_tools_mcp import build_mcp_servers
 
     from scripts.aat_tools_direct import build_direct_tools
@@ -128,3 +127,238 @@ def test_direct_and_mcp_tool_schemas_match(monkeypatch):
         f"resync mcp_servers/direct_adapter.py."
     )
     assert direct_schemas == mcp_schemas
+
+
+# ---------------------------------------------------------------------------
+# Tool results reach the model as valid textual JSON.
+#
+# openai-agents 0.14.5 converts a tool return in items.py::_convert_tool_output
+# with `if all(maybe_converted_output_list)` over a per-element comprehension.
+# all([]) is vacuously True, so an EMPTY list took the structured-content
+# branch and was emitted as a bare [] — not a valid role:tool content value,
+# and rejected outright by at least one hosted provider. Every other structured
+# return fell through to str(output), i.e. Python repr rather than JSON.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ([], "[]"),
+        ({}, "{}"),
+        ([{"failure_mode_id": "FM-001"}], '[{"failure_mode_id": "FM-001"}]'),
+        ({"rul_days": 57}, '{"rul_days": 57}'),
+    ],
+)
+def test_serialize_tool_result_emits_textual_json(value, expected) -> None:
+    from scripts.aat_tools_direct import _serialize_tool_result
+
+    out = _serialize_tool_result(value)
+
+    assert isinstance(out, str)
+    assert out == expected
+
+
+def test_serialize_tool_result_passes_strings_through_unchanged() -> None:
+    """A string is already textual; re-encoding would add quotes and escapes."""
+    from scripts.aat_tools_direct import _serialize_tool_result
+
+    assert _serialize_tool_result("already text") == "already text"
+
+
+def test_serialize_tool_result_preserves_information() -> None:
+    """Encoding must not lose or alter the payload — round-trip it."""
+    import json
+
+    from scripts.aat_tools_direct import _serialize_tool_result
+
+    payload = {
+        "transformer_id": "T-012",
+        "dissolved_h2_ppm": 41.98,
+        "candidates": [{"failure_mode_id": "FM-002", "severity": "medium"}],
+        "empty": [],
+    }
+
+    assert json.loads(_serialize_tool_result(payload)) == payload
+
+
+def test_serialize_tool_result_normalizes_nested_nonfinite_missing_unit_values() -> (
+    None
+):
+    """Missing-unit payloads must remain valid JSON when values are non-finite."""
+    import json
+    import math
+
+    from scripts.aat_tools_direct import _serialize_tool_result
+
+    payload = {
+        "sensor_id": "oil_temp_c",
+        "unit": None,
+        "reading": {
+            "value": math.nan,
+            "limits": [math.inf, -math.inf, 42.0],
+        },
+        "history": [{"value": math.nan}, {"value": 7.5}],
+    }
+
+    encoded = _serialize_tool_result(payload)
+    assert json.loads(encoded) == {
+        "sensor_id": "oil_temp_c",
+        "unit": None,
+        "reading": {"value": None, "limits": [None, None, 42.0]},
+        "history": [{"value": None}, {"value": 7.5}],
+    }
+    assert all(token not in encoded for token in ("NaN", "Infinity", "-Infinity"))
+
+
+def test_build_direct_tools_wrapper_keeps_schema_and_serializes(monkeypatch) -> None:
+    """Wrapping must not disturb the schema function_tool derives."""
+    from scripts import aat_tools_direct
+    from scripts.aat_tools_direct import build_direct_tools
+
+    def search_failure_modes(query: str) -> list:
+        """Search failure modes."""
+        return []
+
+    spec = SimpleNamespace(
+        name="fmsr.search_failure_modes",
+        fn=search_failure_modes,
+        doc="Search failure modes.",
+    )
+    monkeypatch.setattr(aat_tools_direct.direct_adapter, "get_tools", lambda: [spec])
+
+    (tool,) = build_direct_tools()
+
+    assert tool.name == "search_failure_modes"
+    properties = tool.params_json_schema["properties"]
+    assert set(properties) == {"query"}
+    assert properties["query"]["type"] == "string"
+
+
+def test_tsfm_direct_sdk_preserves_raw_anomaly_types_against_mcp(monkeypatch) -> None:
+    """The real SDK tool context must not hide coercible raw Cell A arguments."""
+    from agents.tool_context import ToolContext
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    import mcp_servers.tsfm_server.server as tsfm_server
+    from scripts.aat_tools_direct import build_direct_tools
+
+    readings = pd.DataFrame(
+        {
+            "transformer_id": ["T-synthetic"] * 3,
+            "sensor_id": ["sensor"] * 3,
+            "timestamp": pd.to_datetime(
+                [
+                    "2024-01-01T00:00:00",
+                    "2024-01-01T01:00:00",
+                    "2024-01-01T02:00:00",
+                ]
+            ),
+            "value": [1.0, 1.0, 10.0],
+        }
+    )
+    monkeypatch.setattr(tsfm_server, "_get_readings", lambda: readings)
+    sdk_tool = next(
+        tool for tool in build_direct_tools() if tool.name == "detect_anomalies"
+    )
+
+    def invoke_sdk(arguments: dict) -> dict:
+        raw_arguments = json.dumps(arguments)
+        context = ToolContext(
+            context=None,
+            tool_name=sdk_tool.name,
+            tool_call_id="call-tsfm-validation",
+            tool_arguments=raw_arguments,
+        )
+        result = asyncio.run(sdk_tool.on_invoke_tool(context, raw_arguments))
+        return json.loads(result)
+
+    base_arguments = {
+        "transformer_id": "T-synthetic",
+        "sensor_id": "sensor",
+    }
+    for parameter, invalid_value in (
+        ("window_size", True),
+        ("window_size", "2"),
+        ("z_threshold", True),
+        ("z_threshold", "0.5"),
+    ):
+        arguments = {**base_arguments, parameter: invalid_value}
+        direct_result = invoke_sdk(arguments)
+        assert "error" in direct_result
+        with pytest.raises(ToolError):
+            asyncio.run(tsfm_server.mcp.call_tool("detect_anomalies", arguments))
+
+    valid_arguments = {
+        **base_arguments,
+        "window_size": 2,
+        "z_threshold": 0.5,
+    }
+    direct_result = invoke_sdk(valid_arguments)
+    mcp_result = asyncio.run(
+        tsfm_server.mcp.call_tool("detect_anomalies", valid_arguments)
+    )
+    assert "error" not in direct_result
+    assert (
+        json.loads(mcp_result[0].text)["anomaly_count"]
+        == direct_result["anomaly_count"]
+    )
+
+
+def test_empty_tool_result_becomes_a_valid_role_tool_message() -> None:
+    """End-to-end through the vendor conversion, with a mocked completion.
+
+    This is the exact boundary the bug lives on: the SDK turns a tool return
+    into a ``role: tool`` chat message. Nothing here touches the network.
+    """
+    from openai.types.responses import ResponseFunctionToolCall
+
+    from agents.items import ItemHelpers
+    from agents.models.chatcmpl_converter import Converter
+    from scripts.aat_tools_direct import _serialize_tool_result
+
+    call = ResponseFunctionToolCall(
+        call_id="call_sfm",
+        name="search_failure_modes",
+        arguments='{"query": "Hydrogen"}',
+        type="function_call",
+    )
+    # A real no-match result from a list-returning tool.
+    item = ItemHelpers.tool_call_output_item(call, _serialize_tool_result([]))
+
+    # items_to_messages consumes input-item dicts, not the pydantic call object.
+    messages = Converter.items_to_messages([call.model_dump(), item])
+    tool_messages = [m for m in messages if m.get("role") == "tool"]
+
+    assert len(tool_messages) == 1
+    content = tool_messages[0]["content"]
+    assert isinstance(content, str)
+    assert content == "[]"
+
+
+def test_unserialized_empty_list_would_produce_invalid_content() -> None:
+    """Pin the upstream defect this wrapper exists to work around.
+
+    If a future openai-agents fixes ``all([])``, this test fails and the
+    wrapper can be reconsidered — it is a canary, not a requirement.
+    """
+    from openai.types.responses import ResponseFunctionToolCall
+
+    from agents.items import ItemHelpers
+    from agents.models.chatcmpl_converter import Converter
+
+    call = ResponseFunctionToolCall(
+        call_id="call_sfm",
+        name="search_failure_modes",
+        arguments="{}",
+        type="function_call",
+    )
+    item = ItemHelpers.tool_call_output_item(call, [])  # raw, unserialized
+
+    messages = Converter.items_to_messages([call.model_dump(), item])
+    content = [m for m in messages if m.get("role") == "tool"][0]["content"]
+
+    assert content == [], (
+        "upstream openai-agents appears to have fixed the vacuous all([]) "
+        "branch; revisit _serialize_tool_result"
+    )
