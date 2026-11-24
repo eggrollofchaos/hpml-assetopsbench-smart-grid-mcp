@@ -89,3 +89,6 @@ scripts/check_kb_frontmatter.py
 scripts/sync_cgcignore.py
 scripts/sprint_project_root.py
 scripts/check_pm_format.py
+
+# Local documentation-tooling reviews; not project work
+docs/_reviews/
